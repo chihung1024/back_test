@@ -143,19 +143,23 @@ def fetch_fundamentals(tk: str):
     except Exception:
         return None
 
-def fetch_price_history(tk: str):
+def fetch_price_history(tk):
     """
-    下載單檔價格，若成功回傳 (ticker, True)，失敗回 (ticker, False)
+    下載單支股票歷史價格並存成帶有 Date 欄名的 CSV。
+    回傳 (ticker, True/False) 代表是否成功。
     """
     try:
         df = yf.download(
             tk,
             start="1990-01-01",
-            progress=False,
             auto_adjust=True,
+            progress=False
         )[["Close"]]
+
         if df.empty:
             return tk, False
+
+        # 讓索引欄正式命名為 Date，寫檔時也帶上
         df.index.name = "Date"
         df.to_csv(PRICES_DIR / f"{tk}.csv", index_label="Date")
         return tk, True
