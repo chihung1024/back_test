@@ -1,0 +1,10 @@
+# 排除所有本地資料與中間產物
+data/
+*.csv
+*.parquet
+*.parquet.gz
+
+# 其他可選排除項
+__pycache__/
+*.pyc
+.git/
