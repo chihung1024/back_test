@@ -103,14 +103,27 @@ def fetch_fundamentals(tk):
         return None
 
 def fetch_price_history(tk):
+    """
+    下載單支股票歷史價格並存成帶有 Date 欄名的 CSV
+    """
     try:
-        df = yf.download(tk, start="1990-01-01", progress=False,
-                         auto_adjust=True)[['Close']]
-        if df.empty: return tk, False
-        df.to_csv(PRICES_DIR / f"{tk}.csv")
+        df = yf.download(
+            tk,
+            start="1990-01-01",
+            progress=False,
+            auto_adjust=True
+        )[["Close"]]
+
+        if df.empty:
+            return tk, False
+
+        # 關鍵：命名索引欄並寫入 CSV
+        df.index.name = "Date"
+        df.to_csv(prices_folder / f"{tk}.csv", index_label="Date")
         return tk, True
     except Exception:
         return tk, False
+
 
 # ---------- 4. 主流程 ----------
 def main():
@@ -145,7 +158,7 @@ def main():
     for tk in success:
         path = PRICES_DIR / f"{tk}.csv"
         if not path.exists(): continue
-        df = pd.read_csv(path, index_col='Date', parse_dates=True)
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
         if 'Close' in df.columns:
             frames.append(df['Close'].rename(tk))
     if frames:
