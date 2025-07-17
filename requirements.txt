@@ -7,3 +7,4 @@ requests
 beautifulsoup4
 lxml
 tqdm
+duckdb>=0.10.0
