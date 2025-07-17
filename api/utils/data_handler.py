@@ -23,7 +23,7 @@ def read_price_data_from_repo(tickers: tuple, start_date_str: str, end_date_str:
     # 從 Vercel 的環境變數中動態獲取倉庫擁有者和名稱
     # 如果在本地開發，則使用預設值（請根據您的情況修改）
     owner = os.environ.get('VERCEL_GIT_REPO_OWNER', 'chihung1024') 
-    repo = os.environ.get('VERCEL_GIT_REPO_SLUG', 'stock-backtester')
+    repo = os.environ.get('VERCEL_GIT_REPO_SLUG', 'back_test')
     
     # 建立基礎 URL
     base_url = f"https://raw.githubusercontent.com/{owner}/{repo}/data/prices"
@@ -54,7 +54,7 @@ def get_preprocessed_data():
     從遠端 GitHub data 分支的 raw URL 讀取預處理好的 JSON 數據。
     """
     owner = os.environ.get('VERCEL_GIT_REPO_OWNER', 'chihung1024') 
-    repo = os.environ.get('VERCEL_GIT_REPO_SLUG', 'stock-backtester')
+    repo = os.environ.get('VERCEL_GIT_REPO_SLUG', 'back_test')
     url = f"https://raw.githubusercontent.com/{owner}/{repo}/data/preprocessed_data.json"
     
     try:
