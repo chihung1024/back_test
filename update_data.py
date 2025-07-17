@@ -1,127 +1,126 @@
-import pandas as pd
-import yfinance as yf
-import json
-import time
+import os, json, time, requests, pandas as pd
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+import yfinance as yf
 
-# --- 設定資料儲存路徑 ---
-data_folder = Path("data")
-prices_folder = data_folder / "prices"
-data_folder.mkdir(exist_ok=True)
-prices_folder.mkdir(exist_ok=True)
-PREPROCESSED_JSON_PATH = data_folder / "preprocessed_data.json"
+DATA_DIR      = Path("data")
+PRICES_DIR    = DATA_DIR / "prices"
+PARQUET_PATH  = DATA_DIR / "prices.parquet.gz"
+JSON_PATH     = DATA_DIR / "preprocessed_data.json"
+MAX_WORKERS   = 20
 
-# --- 平行下載設定 ---
-# 同時開啟的下載執行緒數量，可根據需求調整
-MAX_WORKERS = 20
+DATA_DIR.mkdir(exist_ok=True); PRICES_DIR.mkdir(exist_ok=True)
 
-# --- 數據源獲取函式 (維持不變) ---
-def get_etf_holdings(etf_ticker):
+# ---------- A. 指數成分股 ----------
+def fetch_sp500_official():
     try:
-        etf = yf.Ticker(etf_ticker)
-        holdings = etf.holdings
-        if holdings is not None and not holdings.empty:
-            return holdings['symbol'].tolist()
-        return []
-    except Exception:
-        return []
+        html = requests.get("https://www.spglobal.com/spdji/en/indices/equity/sp-500/#overview", timeout=10).text
+        s = html.find("indexMembers"); l = html.find("[", s); r = html.find("]", l) + 1
+        return [m["symbol"] for m in json.loads(html[l:r])]
+    except Exception as e: print("[A] SP500 official failed:", e); return []
+
+def fetch_nasdaq100_official():
+    try:
+        url = "https://api.nasdaq.com/api/quote/NDX/constituents"
+        hdr = {"User-Agent":"Mozilla/5.0"}
+        rows = requests.get(url, headers=hdr, timeout=10).json()["data"]["rows"]
+        return [row["symbol"] for row in rows]
+    except Exception as e: print("[A] NDX official failed:", e); return []
+
+def fetch_index_from_fmp(etf):
+    tok = os.getenv("FMP_TOKEN");  # Basic plan: 250 req/day
+    if not tok: return []
+    try:
+        url = f"https://financialmodelingprep.com/api/v3/etf-holder/{etf}?apikey={tok}"
+        rows = requests.get(url, timeout=10).json()
+        return [r["asset"] for r in rows]
+    except Exception as e: print("[B] FMP", etf, "failed:", e); return []
+
+# ---------- B. 備援 ETF / Wiki ----------
+def get_etf_holdings(etf):
+    try:
+        h = yf.Ticker(etf).holdings
+        return h['symbol'].tolist() if h is not None else []
+    except: return []
 
 def get_sp500_from_wiki():
     try:
-        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-        tables = pd.read_html(url)
-        return tables[0]['Symbol'].str.replace('.', '-', regex=False).tolist()
-    except Exception:
-        return []
+        url='https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        return pd.read_html(url)[0]['Symbol'].str.replace('.', '-').tolist()
+    except: return []
 
 def get_nasdaq100_from_wiki():
     try:
-        url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
-        tables = pd.read_html(url)
-        return tables[4]['Ticker'].tolist()
-    except Exception:
-        return []
+        url='https://en.wikipedia.org/wiki/Nasdaq-100'
+        return pd.read_html(url)[4]['Ticker'].tolist()
+    except: return []
 
-# --- 單一股票處理函式 (優化核心) ---
-def fetch_stock_info(ticker):
-    """獲取單支股票的詳細財務資訊"""
+def get_sp500_list():
+    for fn in (fetch_sp500_official, lambda: fetch_index_from_fmp("VOO")):
+        s = fn();  # official ➜ FMP
+        if s: return s
+    return get_etf_holdings("VOO") or get_sp500_from_wiki()
+
+def get_nasdaq100_list():
+    for fn in (fetch_nasdaq100_official, lambda: fetch_index_from_fmp("QQQ")):
+        s = fn()
+        if s: return s
+    return get_etf_holdings("QQQ") or get_nasdaq100_from_wiki()
+
+# ---------- C. 基本面欄位 ----------
+EXTRA = ['priceToBook','priceToSalesTrailing12Months','ebitdaMargins',
+         'grossMargins','operatingMargins','debtToEquity']
+
+def fetch_fundamentals(tk):
     try:
-        ticker_obj = yf.Ticker(ticker)
-        info = ticker_obj.info
-        if info.get('trailingPE') is None and info.get('marketCap') is None:
-            return None
-        return {
-            'ticker': ticker, 'marketCap': info.get('marketCap'), 'sector': info.get('sector'),
-            'trailingPE': info.get('trailingPE'), 'forwardPE': info.get('forwardPE'),
-            'dividendYield': info.get('dividendYield'), 'returnOnEquity': info.get('returnOnEquity'),
-            'revenueGrowth': info.get('revenueGrowth'), 'earningsGrowth': info.get('earningsGrowth')
-        }
-    except Exception as e:
-        # 在平行處理中，我們只印出錯誤，讓主流程繼續
-        # print(f"  -> 無法獲取 {ticker} 的基本面數據: {e}")
-        return None
+        info = yf.Ticker(tk).info
+        if not info.get('marketCap'): return None
+        d={'ticker':tk,'marketCap':info.get('marketCap'),'sector':info.get('sector'),
+           'trailingPE':info.get('trailingPE'),'forwardPE':info.get('forwardPE'),
+           'dividendYield':info.get('dividendYield'),'returnOnEquity':info.get('returnOnEquity'),
+           'revenueGrowth':info.get('revenueGrowth'),'earningsGrowth':info.get('earningsGrowth')}
+        for k in EXTRA: d[k]=info.get(k)
+        return d
+    except: return None
 
-def fetch_price_history(ticker):
-    """下載單支股票的歷史價格並儲存為 CSV"""
+def fetch_history(tk):
     try:
-        data = yf.download(ticker, start="1990-01-01", auto_adjust=True, progress=False)
-        if not data.empty:
-            price_df = data[['Close']].copy()
-            price_df.to_csv(prices_folder / f"{ticker}.csv")
-            return ticker, True # 回傳成功標記
-        return ticker, False # 回傳失敗標記
-    except Exception as e:
-        # print(f"  -> 下載 {ticker} 價格時發生錯誤: {e}")
-        return ticker, False
+        df=yf.download(tk,start="1990-01-01",progress=False,auto_adjust=True)['Close']
+        if df.empty: return False
+        df.to_csv(PRICES_DIR/f"{tk}.csv"); return True
+    except: return False
 
-# --- 主執行函式 (已重構為平行處理) ---
+# ---------- D. 主入口 ----------
 def main():
-    """主執行函式"""
-    print("--- 開始獲取指數成分股列表 ---")
-    sp500_tickers = get_etf_holdings("VOO") or get_sp500_from_wiki()
-    nasdaq100_tickers = get_etf_holdings("QQQ") or get_nasdaq100_from_wiki()
-    
-    sp500_set = set(sp500_tickers)
-    nasdaq100_set = set(nasdaq100_tickers)
-    all_unique_tickers = sorted(list(sp500_set.union(nasdaq100_set)))
+    t0=time.time()
+    sp=set(get_sp500_list()); nd=set(get_nasdaq100_list())
+    tickers=sorted(sp|nd); print("Total symbols:",len(tickers))
+    if not tickers: return
 
-    if not all_unique_tickers:
-        print("錯誤：所有數據來源均無法獲取任何成分股，終止執行。")
-        return
-    print(f"總共找到 {len(all_unique_tickers)} 支不重複的股票。")
+    # 基本面
+    fun=[]
+    with ThreadPoolExecutor(MAX_WORKERS) as ex:
+        for f in tqdm(as_completed({ex.submit(fetch_fundamentals,t):t for t in tickers}),
+                      total=len(tickers),desc="Fundamentals"):
+            d=f.result();  d and fun.append(d)
+    for d in fun: d['in_sp500']=d['ticker'] in sp; d['in_nasdaq100']=d['ticker'] in nd
 
-    # --- 平行處理基本面數據 ---
-    print("\n--- 步驟 1/2: 平行下載基本面數據 ---")
-    all_stock_data = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # 將下載任務提交到執行緒池
-        future_to_ticker = {executor.submit(fetch_stock_info, ticker): ticker for ticker in all_unique_tickers}
-        # 使用 tqdm 顯示進度條
-        for future in tqdm(as_completed(future_to_ticker), total=len(all_unique_tickers), desc="獲取基本面"):
-            info = future.result()
-            if info:
-                # 補上指數成員標記
-                info['in_sp500'] = info['ticker'] in sp500_set
-                info['in_nasdaq100'] = info['ticker'] in nasdaq100_set
-                all_stock_data.append(info)
+    # 價格
+    with ThreadPoolExecutor(MAX_WORKERS) as ex:
+        _=[f.result() for f in tqdm(as_completed({ex.submit(fetch_history,t):t for t in tickers}),
+                                    total=len(tickers),desc="Prices")]
 
-    with open(PREPROCESSED_JSON_PATH, 'w', encoding='utf-8') as f:
-        json.dump(all_stock_data, f, ensure_ascii=False, indent=4)
-    print(f"基本面數據處理完成，共獲取 {len(all_stock_data)} 筆有效資料。")
+    # Parquet
+    frames=[pd.read_csv(PRICES_DIR/f"{t}.csv",index_col='Date',parse_dates=True)['Close'].rename(t)
+            for t in tickers if (PRICES_DIR/f"{t}.csv").exists()]
+    pd.concat(frames,axis=1).sort_index().to_parquet(PARQUET_PATH,compression='gzip')
 
-    # --- 平行處理歷史價格 ---
-    print("\n--- 步驟 2/2: 平行下載歷史價格數據 ---")
-    success_count = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_ticker = {executor.submit(fetch_price_history, ticker): ticker for ticker in all_unique_tickers}
-        for future in tqdm(as_completed(future_to_ticker), total=len(all_unique_tickers), desc="下載價格"):
-            _ticker, success = future.result()
-            if success:
-                success_count += 1
-    
-    print(f"歷史價格數據更新完成，共成功下載 {success_count} 支股票。")
+    # 如內容沒變則跳過 commit
+    old_hash = pd.util.hash_pandas_object(pd.read_json(JSON_PATH,orient='records'),index=False).sum() if JSON_PATH.exists() else None
+    pd.DataFrame(fun).to_json(JSON_PATH,orient='records',indent=2)
+    new_hash = pd.util.hash_pandas_object(pd.read_json(JSON_PATH,orient='records'),index=False).sum()
+    print("Done in %.1fs"% (time.time()-t0))
+    if old_hash==new_hash: print("No change in fundamentals."); exit(0)
 
-if __name__ == '__main__':
-    main()
+if __name__=="__main__": main()

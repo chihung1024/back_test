@@ -1,54 +1,31 @@
 name: Update Stock Data
-
 on:
-  workflow_dispatch: # 允許手動觸發
+  workflow_dispatch:
   schedule:
-    - cron: '0 8 * * *' # 每日午夜 (UTC) 執行，約為台灣時間早上8點
-
+    - cron: '0 8 * * *'   # 每日 08:00 UTC
 permissions:
-  contents: write # 允許對倉庫內容進行寫入操作
-
+  contents: write
 jobs:
   update-data:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.9'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.10'}
+      - run: |
+          python -m pip install -U pip
           pip install -r requirements.txt
-
-      - name: Run data update script
+      - env:
+          FMP_TOKEN: ${{ secrets.FMP_TOKEN }}
         run: python update_data.py
-
-      - name: Commit and push data to data branch
-        run: |
+      - run: |
           git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          
-          # 切換到一個臨時分支來處理數據
+          git config --local user.name  "GitHub Action"
           git checkout -b temp-data-branch
-          
-          # 強制加入被 .gitignore 忽略的 data 資料夾
           git add -f data/
-          
-          # 檢查是否有變動
-          if ! git diff --staged --quiet; then
-            # 建立一個只包含數據的提交
-            git commit -m "chore: 自動更新股票數據"
-            
-            # 強制將當前分支的內容推送到遠端的 data 分支
-            # -f (force) 選項會完全覆蓋遠端 data 分支的歷史，確保每次都是最新的數據
-            git push -f origin temp-data-branch:data
-            
-            echo "數據已成功推送到 data 分支。"
-          else
-            echo "數據無變動，無需提交。"
+          if git diff --staged --quiet; then
+            echo "No change – skip commit."; exit 0
           fi
+          git commit -m "chore: auto-update data $(date -u +'%F')"
+          git push -f origin temp-data-branch:data
+      - run: git gc --prune=now --aggressive

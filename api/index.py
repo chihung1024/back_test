@@ -120,7 +120,13 @@ def validate_data_completeness(df_prices_raw, all_tickers, requested_start_date)
 def download_data_silently(tickers, start_date, end_date):
     old_stdout = sys.stdout; sys.stdout = StringIO()
     try:
-        data = yf.download(list(tickers), start=start_date, end=end_date, auto_adjust=True, progress=False)['Close']
+        chunks = [tickers[i:i+15] for i in range(0, len(tickers), 15)]
+        dfs = []
+        for c in chunks:
+            part = yf.download(list(c), start=start_date, end=end_date,
+                auto_adjust=True, progress=False)['Close']
+            dfs.append(part)
+        data = pd.concat(dfs, axis=1)
     finally:
         sys.stdout = old_stdout
     return data
