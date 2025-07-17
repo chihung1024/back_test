@@ -9,9 +9,24 @@ REPO  = os.environ.get('VERCEL_GIT_REPO_SLUG', 'back_test')
 BASE  = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/data"
 
 @cached(CACHE)
+@cached(CACHE)
 def _read_parquet():
-    try:  return pd.read_parquet(f"{BASE}/prices.parquet.gz",engine='pyarrow')
-    except: return None
+    """
+    優先嘗試讀取 Parquet；若執行環境未安裝 pyarrow / fastparquet
+    或檔案讀取失敗，就回傳 None，後續流程會自動改讀多檔 CSV。
+    """
+    # 1) 檢查是否有 Parquet 引擎
+    try:
+        import pyarrow  # noqa: F401
+    except ModuleNotFoundError:
+        return None
+
+    # 2) 有引擎才嘗試讀檔
+    try:
+        return pd.read_parquet(f"{BASE}/prices.parquet.gz")
+    except Exception:
+        return None
+
 
 @cached(CACHE)
 def read_price_data_from_repo(tickers:tuple,start:str,end:str):
