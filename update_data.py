@@ -135,24 +135,51 @@ def fetch_fundamentals(ticker: str):
     except Exception:
         return None
 
-def fetch_history(ticker: str):
+import time
+import yfinance as yf
+
+def fetch_history(ticker: str, max_retries: int = 3, pause_sec: float = 1.0):
     """
-    下載歷史價格成功 → (ticker, True)
-    下載失敗或無 Close 欄 → (ticker, False)
+    下載單檔歷史價格。
+    成功：回傳 (ticker, True) 且在 data/prices 生成 <ticker>.csv.gz
+    失敗：重試 max_retries 次仍無資料 → 回傳 (ticker, False)
+
+    兩項額外優化：
+    1. 將索引欄命名為 'Date'，避免後續 read_csv(index_col='Date') 時找不到欄名。
+    2. 直接輸出為 gzip 壓縮檔，可將檔案體積縮小 70%–80%。
     """
-    try:
-        df = yf.download(
-            ticker,
-            start="1990-01-01",
-            progress=False,
-            auto_adjust=True
-        )
-        if df.empty or "Close" not in df.columns:
-            return ticker, False
-        df[["Close"]].to_csv(PRICES_DIR / f"{ticker}.csv")
-        return ticker, True
-    except Exception:
-        return ticker, False
+    for attempt in range(1, max_retries + 1):
+        try:
+            df = yf.download(
+                ticker,
+                start="1990-01-01",
+                progress=False,
+                auto_adjust=True
+            )
+
+            # 檢查必備欄位
+            if df.empty or "Close" not in df.columns:
+                raise ValueError("empty frame or no Close column")
+
+            # 只保留收盤價並設定索引欄名稱
+            out = df[["Close"]].copy()
+            out.index.name = "Date"
+
+            # 儲存為 gzip 壓縮 CSV
+            out.to_csv(
+                PRICES_DIR / f"{ticker}.csv.gz",
+                index_label="Date",
+                compression="gzip"
+            )
+            return ticker, True
+
+        except Exception as e:
+            if attempt == max_retries:
+                # 最後一次仍失敗 → 回傳 False
+                return ticker, False
+            # 等待後重試
+            time.sleep(pause_sec)
+
 
 # ─── 3. 主流程 ───────────────────────────────────────────────
 def main():
