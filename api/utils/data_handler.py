@@ -8,7 +8,7 @@ CACHE = TTLCache(maxsize=256, ttl=43200)   # 12 小時
 
 OWNER = os.environ.get("VERCEL_GIT_REPO_OWNER", "chihung1024")
 REPO  = os.environ.get("VERCEL_GIT_REPO_SLUG", "back_test")
-BASE  = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/data"
+BASE = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/data/data"
 
 # --------------------------------------------------
 # Parquet → CSV 回退
