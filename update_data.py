@@ -1,3 +1,10 @@
+# ── update_data.py（優化完整版本）────────────────────────────
+# 功能：
+# 1. 先抓官方 S&P 500 / Nasdaq-100 成分；失敗改用 FMP；再失敗回 ETF / Wiki
+# 2. 多執行緒下載基本面與歷史價格
+# 3. 只對下載成功的股票合併 Parquet，避免 “KeyError: 'Close'”
+# 4. 若基本面資料與前次相同就跳過寫檔，減少無意義 commit
+
 import os, json, time, requests, pandas as pd
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,64 +22,84 @@ DATA_DIR.mkdir(exist_ok=True)
 PRICES_DIR.mkdir(exist_ok=True)
 
 # ─── 1. 取得指數成分股 ───────────────────────────────────────
-def sp500_official():
+def sp500_official() -> list[str]:
+    """直接解析 S&P 官網頁面隱藏的 indexMembers JSON。"""
     try:
-        html = requests.get("https://www.spglobal.com/spdji/en/indices/equity/sp-500/#overview", timeout=10).text
+        html = requests.get(
+            "https://www.spglobal.com/spdji/en/indices/equity/sp-500/#overview",
+            timeout=10
+        ).text
         i = html.find("indexMembers")
-        if i == -1: return []
-        l = html.find("[", i); r = html.find("]", l) + 1
+        if i == -1:
+            return []
+        l = html.find("[", i)
+        r = html.find("]", l) + 1
         return [m["symbol"] for m in json.loads(html[l:r])]
     except Exception:
         return []
 
-def nasdaq_official():
+def nasdaq_official() -> list[str]:
+    """使用 Nasdaq 官方 JSON API。"""
     try:
         hdr = {"User-Agent": "Mozilla/5.0"}
-        rows = requests.get("https://api.nasdaq.com/api/quote/NDX/constituents", headers=hdr, timeout=10).json()["data"]["rows"]
+        rows = requests.get(
+            "https://api.nasdaq.com/api/quote/NDX/constituents",
+            headers=hdr,
+            timeout=10
+        ).json()["data"]["rows"]
         return [r["symbol"] for r in rows]
     except Exception:
         return []
 
-def fmp_etf_components(etf: str):
+def fmp_etf_components(etf: str) -> list[str]:
+    """
+    以 FMP API 當備援來源：
+    https://financialmodelingprep.com/api/v3/etf-holder/{etf}
+    """
     key = os.getenv("FMP_TOKEN")
     if not key:
         return []
     try:
         url  = f"https://financialmodelingprep.com/api/v3/etf-holder/{etf}?apikey={key}"
         rows = requests.get(url, timeout=10).json()
-        return [row.get("symbol") or row.get("asset") for row in rows if isinstance(row, dict)]
+        return [
+            row.get("symbol") or row.get("asset")
+            for row in rows
+            if isinstance(row, dict)
+        ]
     except Exception:
         return []
 
-def etf_holdings(etf: str):
+def etf_holdings(etf: str) -> list[str]:
+    """最後備援：直接看 ETF 成份。"""
     try:
         hold = yf.Ticker(etf).holdings
         return hold["symbol"].tolist() if hold is not None else []
     except Exception:
         return []
 
-def wiki_sp500():
+def wiki_sp500() -> list[str]:
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         return pd.read_html(url)[0]["Symbol"].str.replace(".", "-").tolist()
     except Exception:
         return []
 
-def wiki_nasdaq100():
+def wiki_nasdaq100() -> list[str]:
     try:
         url = "https://en.wikipedia.org/wiki/Nasdaq-100"
         return pd.read_html(url)[4]["Ticker"].tolist()
     except Exception:
         return []
 
-def get_sp500():
+def get_sp500() -> list[str]:
     for fn in (sp500_official, lambda: fmp_etf_components("VOO")):
         res = fn()
         if res:
             return res
     return etf_holdings("VOO") or wiki_sp500()
 
-def get_nasdaq100():
+def get_nasdaq100() -> list[str]:
     for fn in (nasdaq_official, lambda: fmp_etf_components("QQQ")):
         res = fn()
         if res:
@@ -86,6 +113,7 @@ BASIC_EXTRA = [
 ]
 
 def fetch_fundamentals(ticker: str):
+    """抓取單檔基本面，失敗回傳 None。"""
     try:
         info = yf.Ticker(ticker).info
         if not info.get("marketCap"):
@@ -109,11 +137,16 @@ def fetch_fundamentals(ticker: str):
 
 def fetch_history(ticker: str):
     """
-    下載成功 → 回傳 (ticker, True)  
-    失敗     → 回傳 (ticker, False)
+    下載歷史價格成功 → (ticker, True)
+    下載失敗或無 Close 欄 → (ticker, False)
     """
     try:
-        df = yf.download(ticker, start="1990-01-01", progress=False, auto_adjust=True)
+        df = yf.download(
+            ticker,
+            start="1990-01-01",
+            progress=False,
+            auto_adjust=True
+        )
         if df.empty or "Close" not in df.columns:
             return ticker, False
         df[["Close"]].to_csv(PRICES_DIR / f"{ticker}.csv")
@@ -124,49 +157,51 @@ def fetch_history(ticker: str):
 # ─── 3. 主流程 ───────────────────────────────────────────────
 def main():
     t0 = time.time()
-    sp500_tickers   = set(get_sp500())
-    nasdaq_tickers  = set(get_nasdaq100())
-    all_tickers     = sorted(sp500_tickers | nasdaq_tickers)
 
-    if not all_tickers:
-        print("❌ 無法取得任何成分股，結束執行"); return
-    print("Total symbols:", len(all_tickers))
+    sp500_set  = set(get_sp500())
+    ndx_set    = set(get_nasdaq100())
+    tickers    = sorted(sp500_set | ndx_set)
 
-    # 基本面
+    if not tickers:
+        print("❌ 無法取得任何成份股，結束執行"); return
+    print("Total symbols:", len(tickers))
+
+    # 3-1 基本面
     fundamentals = []
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        fut_map = {ex.submit(fetch_fundamentals, t): t for t in all_tickers}
-        for fut in tqdm(as_completed(fut_map), total=len(fut_map), desc="Fundamentals"):
+        jobs = {ex.submit(fetch_fundamentals, t): t for t in tickers}
+        for fut in tqdm(as_completed(jobs), total=len(jobs), desc="Fundamentals"):
             data = fut.result()
             if data:
                 fundamentals.append(data)
 
     for row in fundamentals:
-        row["in_sp500"]     = row["ticker"] in sp500_tickers
-        row["in_nasdaq100"] = row["ticker"] in nasdaq_tickers
+        row["in_sp500"]     = row["ticker"] in sp500_set
+        row["in_nasdaq100"] = row["ticker"] in ndx_set
 
-    # 歷史價格
+    # 3-2 歷史價格
     success = set()
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        fut_map = {ex.submit(fetch_history, t): t for t in all_tickers}
-        for fut in tqdm(as_completed(fut_map), total=len(fut_map), desc="Prices"):
-            tkr, ok = fut.result()
+        jobs = {ex.submit(fetch_history, t): t for t in tickers}
+        for fut in tqdm(as_completed(jobs), total=len(jobs), desc="Prices"):
+            tk, ok = fut.result()
             if ok:
-                success.add(tkr)
+                success.add(tk)
 
     frames = []
-    for tkr in success:
-        fp = PRICES_DIR / f"{tkr}.csv"
-        if not fp.exists():
-            continue
-        df = pd.read_csv(fp, index_col="Date", parse_dates=True)
-        if "Close" in df.columns:
-            frames.append(df["Close"].rename(tkr))
+    for tk in success:
+        csv_path = PRICES_DIR / f"{tk}.csv"
+        if csv_path.exists():
+            df = pd.read_csv(csv_path, index_col="Date", parse_dates=True)
+            if "Close" in df.columns:
+                frames.append(df["Close"].rename(tk))
 
     if frames:
-        pd.concat(frames, axis=1).sort_index().to_parquet(PARQUET_FILE, compression="gzip")
+        (pd.concat(frames, axis=1)
+           .sort_index()
+           .to_parquet(PARQUET_FILE, compression="gzip"))
 
-    # 基本面變更偵測
+    # 3-3 基本面變更偵測
     new_df = pd.DataFrame(fundamentals).sort_values("ticker").reset_index(drop=True)
     if JSON_FILE.exists():
         old_df = pd.read_json(JSON_FILE, orient="records")
@@ -174,7 +209,7 @@ def main():
             print("ℹ️ 基本面無變動，跳過寫檔"); return
 
     new_df.to_json(JSON_FILE, orient="records", indent=2)
-    print(f"✅ 更新完成，耗時 {time.time()-t0:.1f}s")
+    print(f"✅ 更新完成，耗時 {time.time() - t0:.1f}s")
 
 if __name__ == "__main__":
     main()
