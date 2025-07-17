@@ -16,13 +16,14 @@ BASE  = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/data"
 @cached(CACHE)
 def _read_parquet():
     """
-    優先嘗試讀 Parquet；若執行環境沒有 pyarrow/fastparquet，
-    或檔案讀取失敗，就回傳 None 讓下游改讀多檔 CSV。
+    先嘗試讀 Parquet；若伺服器沒安裝 pyarrow / fastparquet
+    或檔案讀取失敗，直接回傳 None，後續自動改讀多檔 CSV。
     """
     try:
         import pyarrow  # noqa: F401
     except ModuleNotFoundError:
         return None
+
     try:
         return pd.read_parquet(f"{BASE}/prices.parquet.gz")
     except Exception:
