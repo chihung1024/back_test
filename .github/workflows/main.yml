@@ -1,4 +1,4 @@
-name: Update Stock Data
+name: Update Stock Data dev
 on:
   workflow_dispatch:
   schedule:
@@ -28,13 +28,13 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name  "GitHub Action"
-          git checkout -b temp-data-branch
-          git add -f data/
+          git checkout -b temp-dev-data-branch
+          git add -f dev-data/
           if git diff --staged --quiet; then
             echo "No change – skip commit."
             exit 0
           fi
-          git commit -m "chore: auto-update data $(date -u +'%F')"
-          git push -f origin temp-data-branch:data
+          git commit -m "chore: auto-update dev-data $(dev-date -u +'%F')"
+          git push -f origin temp-dev-data-branch:dev-data
 
       - run: git gc --prune=now --aggressive
