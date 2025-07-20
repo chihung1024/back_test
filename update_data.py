@@ -135,16 +135,18 @@ def fetch_fundamentals(ticker: str):
     except Exception:
         return None
 
+import time
+import yfinance as yf
+
 def fetch_history(ticker: str, max_retries: int = 3, pause_sec: float = 1.0):
     """
     下載單檔歷史價格。
-    成功：回傳 (ticker, True) 且在 data/prices 生成 .csv.gz
+    成功：回傳 (ticker, True) 且在 data/prices 生成 <ticker>.csv.gz
     失敗：重試 max_retries 次仍無資料 → 回傳 (ticker, False)
 
     兩項額外優化：
     1. 將索引欄命名為 'Date'，避免後續 read_csv(index_col='Date') 時找不到欄名。
     2. 直接輸出為 gzip 壓縮檔，可將檔案體積縮小 70%–80%。
-    3. 明確使用 auto_adjust=True，確保獲取的是還原股價，解決數據一致性問題。
     """
     for attempt in range(1, max_retries + 1):
         try:
@@ -152,24 +154,21 @@ def fetch_history(ticker: str, max_retries: int = 3, pause_sec: float = 1.0):
                 ticker,
                 start="1990-01-01",
                 progress=False,
-                auto_adjust=True  # 關鍵：自動處理股票分割和股息，獲取還原股價
+                auto_adjust=True
             )
 
-            # 關鍵檢查：確保 df.index 是 DatetimeIndex 且有資料
-            if not isinstance(df.index, pd.DatetimeIndex) or df.empty:
-                raise ValueError("Invalid data: index is not DatetimeIndex or df is empty")
-
             # 檢查必備欄位
-            if "Close" not in df.columns:
+            if df.empty or "Close" not in df.columns:
                 raise ValueError("empty frame or no Close column")
 
             # 只保留收盤價並設定索引欄名稱
             out = df[["Close"]].copy()
-            out.reset_index(inplace=True) # Make 'Date' a regular column
-            out.rename(columns={'index': 'Date'}, inplace=True) # Ensure the column is named 'Date'
+            out.index.name = "Date"
+
+            # 儲存為 gzip 壓縮 CSV
             out.to_csv(
                 PRICES_DIR / f"{ticker}.csv.gz",
-                index=False, # Do not write the index as a column
+                index_label="Date",
                 compression="gzip"
             )
             return ticker, True
@@ -200,7 +199,7 @@ def main():
         jobs = {ex.submit(fetch_fundamentals, t): t for t in tickers}
         for fut in tqdm(as_completed(jobs), total=len(jobs), desc="Fundamentals"):
             data = fut.result()
-            if data is not None:
+            if data:
                 fundamentals.append(data)
 
     for row in fundamentals:
@@ -216,15 +215,13 @@ def main():
             if ok:
                 success.add(tk)
 
-    # 從 data/prices/*.csv.gz 讀取所有成功的檔案並合併
     frames = []
-    # 只讀取下載成功的股票
-    price_files = [PRICES_DIR / f"{tk}.csv.gz" for tk in success]
-    for f in tqdm(price_files, desc="Combining prices"):
-        if f.exists():
-            df = pd.read_csv(f, parse_dates=["Date"]).set_index("Date")
-            # 將 Series 命名為其股票代碼
-            frames.append(df["Close"].rename(f.stem.split('.')[0]))
+    for tk in success:
+        csv_path = PRICES_DIR / f"{tk}.csv"
+        if csv_path.exists():
+            df = pd.read_csv(csv_path, index_col="Date", parse_dates=True)
+            if "Close" in df.columns:
+                frames.append(df["Close"].rename(tk))
 
     if frames:
         (pd.concat(frames, axis=1)
@@ -232,21 +229,9 @@ def main():
            .to_parquet(PARQUET_FILE, compression="gzip"))
 
     # 3-3 基本面變更偵測
-    if not fundamentals:
-        print("ℹ️ 無法取得任何基本面資料，跳過基本面變更偵測。")
-        # Create an empty DataFrame with expected columns to avoid KeyError later
-        columns = ["ticker", "marketCap", "sector", "trailingPE", "forwardPE",
-                   "dividendYield", "returnOnEquity", "revenueGrowth", "earningsGrowth"] + BASIC_EXTRA
-        new_df = pd.DataFrame(columns=columns)
-    else:
-        new_df = pd.DataFrame(fundamentals).sort_values("ticker").reset_index(drop=True)
-
+    new_df = pd.DataFrame(fundamentals).sort_values("ticker").reset_index(drop=True)
     if JSON_FILE.exists():
         old_df = pd.read_json(JSON_FILE, orient="records")
-        # Ensure old_df has the same columns as new_df for comparison, if new_df is empty
-        if new_df.empty and not old_df.empty:
-            old_df = pd.DataFrame(columns=new_df.columns) # Adjust old_df to match empty new_df structure
-
         if new_df.equals(old_df):
             print("ℹ️ 基本面無變動，跳過寫檔"); return
 
