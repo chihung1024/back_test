@@ -135,16 +135,18 @@ def fetch_fundamentals(ticker: str):
     except Exception:
         return None
 
+import time
+import yfinance as yf
+
 def fetch_history(ticker: str, max_retries: int = 3, pause_sec: float = 1.0):
     """
     下載單檔歷史價格。
-    成功：回傳 (ticker, True) 且在 data/prices 生成 .csv.gz
+    成功：回傳 (ticker, True) 且在 data/prices 生成 <ticker>.csv.gz
     失敗：重試 max_retries 次仍無資料 → 回傳 (ticker, False)
 
     兩項額外優化：
     1. 將索引欄命名為 'Date'，避免後續 read_csv(index_col='Date') 時找不到欄名。
     2. 直接輸出為 gzip 壓縮檔，可將檔案體積縮小 70%–80%。
-    3. 明確使用 auto_adjust=True，確保獲取的是還原股價，解決數據一致性問題。
     """
     for attempt in range(1, max_retries + 1):
         try:
@@ -152,7 +154,7 @@ def fetch_history(ticker: str, max_retries: int = 3, pause_sec: float = 1.0):
                 ticker,
                 start="1990-01-01",
                 progress=False,
-                auto_adjust=True  # 關鍵：自動處理股票分割和股息，獲取還原股價
+                auto_adjust=True
             )
 
             # 檢查必備欄位
@@ -213,13 +215,12 @@ def main():
             if ok:
                 success.add(tk)
 
-    # 從 data/prices/*.csv.gz 讀取所有成功的檔案並合併
     frames = []
-    # 只讀取下載成功的股票
     price_files = [PRICES_DIR / f"{tk}.csv.gz" for tk in success]
     for f in tqdm(price_files, desc="Combining prices"):
         if f.exists():
-            df = pd.read_csv(f, index_col="Date", parse_dates=True)
+            # 修正：使用 index_col=0 明確指定第一欄為索引，避免 'Date' not found 的錯誤
+            df = pd.read_csv(f, index_col=0, parse_dates=True)
             # 將 Series 命名為其股票代碼
             frames.append(df["Close"].rename(f.stem.split('.')[0]))
 
