@@ -155,8 +155,12 @@ def fetch_history(ticker: str, max_retries: int = 3, pause_sec: float = 1.0):
                 auto_adjust=True  # 關鍵：自動處理股票分割和股息，獲取還原股價
             )
 
+            # 關鍵檢查：確保 df.index 是 DatetimeIndex 且有資料
+            if not isinstance(df.index, pd.DatetimeIndex) or df.empty:
+                raise ValueError("Invalid data: index is not DatetimeIndex or df is empty")
+
             # 檢查必備欄位
-            if df.empty or "Close" not in df.columns:
+            if "Close" not in df.columns:
                 raise ValueError("empty frame or no Close column")
 
             # 只保留收盤價並設定索引欄名稱
