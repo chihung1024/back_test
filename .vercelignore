@@ -4,11 +4,6 @@ data/
 *.parquet
 *.parquet.gz
 
-# 新增的忽略規則
-constituents/
-fundamentals/
-prices/
-
 # 其他可選排除項
 __pycache__/
 *.pyc
