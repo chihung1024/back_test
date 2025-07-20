@@ -7,7 +7,3 @@ requests
 beautifulsoup4
 lxml
 tqdm
-pystooq
-pyarrow
-vercel-blob
-python-dotenv
