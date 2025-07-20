@@ -1,12 +1,9 @@
-Flask
+flask
+yfinance
 pandas
 numpy
-yfinance
+cachetools
 requests
-lxml
 beautifulsoup4
-# 新增以下函式庫
-stooqpy
-pyarrow
-vercel-blob
-python-dotenv
+lxml
+tqdm
