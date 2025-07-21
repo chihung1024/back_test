@@ -1,118 +1,180 @@
 from flask import Flask, request, jsonify
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from pandas.tseries.offsets import BDay, MonthEnd
-import sys, os
+import yfinance as yf, pandas as pd, numpy as np, os, sys, requests
 from io import StringIO
+from pandas.tseries.offsets import BDay, MonthEnd
 from cachetools import cached, TTLCache
-import requests
+from api.utils.calculations import calculate_metrics, EPSILON, RISK_FREE_RATE, DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR
 
-app = Flask(__name__)
-
-# --- 全域常數 ---
-RISK_FREE_RATE = 0
-TRADING_DAYS_PER_YEAR = 252
-DAYS_PER_YEAR = 365.25
-EPSILON = 1e-9
-
-# --- 快取設定 ---
+app   = Flask(__name__)
 cache = TTLCache(maxsize=128, ttl=600)
 
-# --- 環境變數讀取 ---
-GIST_RAW_URL = os.environ.get('GIST_RAW_URL')
+# -------------------------------------------------
+# 工具：靜默下載（支援快取）
+# -------------------------------------------------
+@cached(cache)
+def download_data_silently(tickers, start_date, end_date):
+    old_stdout = sys.stdout
+    sys.stdout  = StringIO()           # 關閉 yf.download 的進度列
+    try:
+        chunks = [tickers[i:i + 15] for i in range(0, len(tickers), 15)]
+        parts  = [yf.download(chunk, start=start_date, end=end_date,
+                              auto_adjust=True, progress=False)['Close']
+                  for chunk in chunks]
+        return pd.concat(parts, axis=1)
+    finally:
+        sys.stdout = old_stdout
 
-def calculate_metrics(portfolio_history, benchmark_history=None, risk_free_rate=RISK_FREE_RATE):
-    """
-    計算：CAGR, MDD, Volatility, Sharpe, Sortino, Beta, Alpha, Custom
-    """
-    if portfolio_history.empty or len(portfolio_history) < 2:
-        return {'cagr': 0, 'mdd': 0, 'volatility': 0,
-                'sharpe_ratio': 0, 'sortino_ratio': 0,
-                'beta': None, 'alpha': None, 'custom_score': 0}
+# -------------------------------------------------
+# 回測主計算
+# -------------------------------------------------
+def get_rebalancing_dates(df_prices, period):
+    if period == 'never':
+        return []
+    df = df_prices.copy()
+    df['year']  = df.index.year
+    df['month'] = df.index.month
+    if period == 'annually':
+        dates = df.drop_duplicates(subset=['year'], keep='first').index
+    elif period == 'quarterly':
+        df['q'] = df.index.quarter
+        dates   = df.drop_duplicates(subset=['year', 'q'], keep='first').index
+    elif period == 'monthly':
+        dates = df.drop_duplicates(subset=['year', 'month'], keep='first').index
+    else:
+        return []
+    return dates[1:] if len(dates) > 1 else []
 
-    end_value   = portfolio_history['value'].iloc[-1]
-    start_value = portfolio_history['value'].iloc[0]
-    if start_value < EPSILON:
-        return {'cagr': 0, 'mdd': -1, 'volatility': 0,
-                'sharpe_ratio': 0, 'sortino_ratio': 0,
-                'beta': None, 'alpha': None, 'custom_score': 0}
+def run_simulation(port_cfg, price_data, initial_amt, benchmark_hist=None):
+    tickers  = port_cfg['tickers']
+    weights  = np.array(port_cfg['weights']) / 100.0
+    period   = port_cfg['rebalancingPeriod']
 
-    start_date = portfolio_history.index[0]
-    end_date   = portfolio_history.index[-1]
-    years      = (end_date - start_date).days / DAYS_PER_YEAR
-    cagr       = (end_value / start_value)**(1/years) - 1 if years>0 else 0
+    df_prices = price_data[tickers].copy()
+    if df_prices.empty:
+        return None
 
-    # 最大回撤
-    portfolio_history['peak']     = portfolio_history['value'].cummax()
-    portfolio_history['drawdown'] = (
-        portfolio_history['value'] - portfolio_history['peak']
-    )/(portfolio_history['peak']+EPSILON)
-    mdd = portfolio_history['drawdown'].min()
+    port_hist = pd.Series(index=df_prices.index, dtype=float, name='value')
+    rebal_dates = get_rebalancing_dates(df_prices, period)
 
-    # 日報酬率
-    daily_returns = portfolio_history['value'].pct_change().dropna()
-    if len(daily_returns)<2:
-        return {'cagr': cagr, 'mdd': mdd, 'volatility': 0,
-                'sharpe_ratio': 0, 'sortino_ratio': 0,
-                'beta': None, 'alpha': None, 'custom_score': 0}
+    first_date   = df_prices.index[0]
+    shares       = (initial_amt * weights) / (df_prices.loc[first_date] + EPSILON)
+    port_hist.loc[first_date] = initial_amt
 
-    # 波動率 & Sharpe
-    annual_std            = daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
-    annual_excess_return  = cagr - risk_free_rate
-    sharpe_ratio          = annual_excess_return/(annual_std+EPSILON)
+    for idx in range(1, len(df_prices)):
+        cur_date   = df_prices.index[idx]
+        cur_prices = df_prices.loc[cur_date]
+        value      = (shares * cur_prices).sum()
+        port_hist.loc[cur_date] = value
+        if cur_date in rebal_dates:
+            shares = (value * weights) / (cur_prices + EPSILON)
 
-    # Sortino
-    daily_rf   = (1+risk_free_rate)**(1/TRADING_DAYS_PER_YEAR)-1
-    downside   = daily_returns - daily_rf
-    downside[downside>0] = 0
-    downside_std  = np.sqrt((downside**2).mean()) * np.sqrt(TRADING_DAYS_PER_YEAR)
-    sortino_ratio = annual_excess_return/downside_std if downside_std>EPSILON else 0.0
+    port_hist.dropna(inplace=True)
+    metrics = calculate_metrics(port_hist.to_frame('value'), benchmark_hist)
+    return {'name': port_cfg['name'],
+            **metrics,
+            'portfolioHistory': [{'date': d.strftime('%Y-%m-%d'), 'value': v}
+                                 for d, v in port_hist.items()]}
 
-    # Beta & Alpha
-    beta, alpha = None, None
-    if benchmark_history is not None and not benchmark_history.empty:
-        bench_ret = benchmark_history['value'].pct_change().dropna()
-        aligned   = pd.concat([daily_returns, bench_ret], axis=1, join='inner')
-        aligned.columns = ['portfolio','benchmark']
-        if len(aligned)>1:
-            cov_mat   = aligned.cov()
-            cov       = cov_mat.iloc[0,1]
-            var_bench = cov_mat.iloc[1,1]
-            if var_bench>EPSILON:
-                beta = cov/var_bench
-                be = benchmark_history['value']
-                bench_cagr = (be.iloc[-1]/be.iloc[0])**(1/years)-1 if years>0 else 0
-                expected = risk_free_rate + beta*(bench_cagr-risk_free_rate)
-                alpha    = cagr-expected
+# -------------------------------------------------
+# /api/backtest
+# -------------------------------------------------
+@app.post('/api/backtest')
+def backtest_handler():
+    try:
+        data = request.get_json()
+        start_str = f"{data['startYear']}-{data['startMonth']}-01"
+        end_dt    = pd.to_datetime(f"{data['endYear']}-{data['endMonth']}-01") + MonthEnd(0)
+        end_str   = end_dt.strftime('%Y-%m-%d')
 
-    # 清理
-    sharpe_ratio  = 0.0 if not np.isfinite(sharpe_ratio) else sharpe_ratio
-    sortino_ratio = 0.0 if not np.isfinite(sortino_ratio) else sortino_ratio
-    beta          = None  if beta is not None and not np.isfinite(beta) else beta
-    alpha         = None  if alpha is not None and not np.isfinite(alpha) else alpha
+        all_tks = {t for p in data['portfolios'] for t in p['tickers']}
+        bench   = data.get('benchmark')
+        if bench:
+            all_tks.add(bench)
+        if not all_tks:
+            return jsonify({'error': '未提供任何股票代碼'}), 400
 
-    # 自訂指標
-    alpha_val    = alpha if alpha is not None else 0.0
-    custom_score = sortino_ratio * alpha_val * (1 + mdd)
+        df_raw = download_data_silently(tuple(sorted(all_tks)), start_str, end_str)
+        if isinstance(df_raw, pd.Series):
+            df_raw = df_raw.to_frame(name=list(all_tks)[0])
 
-    return {
-        'cagr': cagr, 'mdd': mdd, 'volatility': annual_std,
-        'sharpe_ratio': sharpe_ratio, 'sortino_ratio': sortino_ratio,
-        'beta': beta, 'alpha': alpha, 'custom_score': custom_score
-    }
+        df_common = df_raw.dropna()
+        if df_common.empty:
+            return jsonify({'error': '無共同交易日'}), 400
 
-def run_simulation(portfolio_config, price_data, initial_amount, benchmark_history=None):
-    # ...（此處保持原邏輯不變）...
-    metrics = calculate_metrics(portfolio_history.to_frame('value'), benchmark_history)
-    return {
-        'name': portfolio_config['name'],
-        **metrics,
-        'portfolioHistory': [
-            {'date': date.strftime('%Y-%m-%d'), 'value': value}
-            for date, value in portfolio_history.items()
-        ]
-    }
+        initial_amt = float(data['initialAmount'])
 
-# 其餘 API 端點與輔助函式保持不變
-# ... backtest_handler, scan_handler, screener_handler, debug_handler etc. ...
+        bench_res, bench_hist = None, None
+        if bench and bench in df_common.columns:
+            bench_cfg = {'name': bench, 'tickers': [bench],
+                         'weights': [100], 'rebalancingPeriod': 'never'}
+            bench_res = run_simulation(bench_cfg, df_common, initial_amt)
+            if bench_res:
+                bench_hist = pd.DataFrame(bench_res['portfolioHistory'])\
+                               .set_index('date').astype(float)
+                bench_hist.index = pd.to_datetime(bench_hist.index)
+
+        results = []
+        for p_cfg in data['portfolios']:
+            res = run_simulation(p_cfg, df_common, initial_amt, bench_hist)
+            if res:
+                results.append(res)
+
+        if not results:
+            return jsonify({'error': '回測失敗'}), 400
+
+        return jsonify({'data': results, 'benchmark': bench_res})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+# -------------------------------------------------
+# /api/scan
+# -------------------------------------------------
+@app.post('/api/scan')
+def scan_handler():
+    try:
+        data     = request.get_json()
+        tickers  = data['tickers']
+        bench    = data.get('benchmark')
+        start    = f"{data['startYear']}-{data['startMonth']}-01"
+        end_dt   = pd.to_datetime(f"{data['endYear']}-{data['endMonth']}-01") + MonthEnd(0)
+        end      = end_dt.strftime('%Y-%m-%d')
+
+        all_dl = set(tickers)
+        if bench:
+            all_dl.add(bench)
+
+        df_raw = download_data_silently(tuple(sorted(all_dl)), start, end)
+        if isinstance(df_raw, pd.Series):
+            df_raw = df_raw.to_frame(name=list(all_dl)[0])
+
+        bench_hist = None
+        if bench and bench in df_raw.columns:
+            bench_hist = df_raw[[bench]].dropna().rename(columns={bench: 'value'})
+
+        results = []
+        for tk in tickers:
+            if tk not in df_raw.columns:
+                results.append({'ticker': tk, 'error': '無數據'})
+                continue
+            prices = df_raw[tk].dropna()
+            if prices.empty:
+                results.append({'ticker': tk, 'error': '無有效價格'})
+                continue
+            hist_df = prices.to_frame(name='value')
+            metrics = calculate_metrics(hist_df, bench_hist)
+            results.append({'ticker': tk, **metrics})
+
+        return jsonify(results)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+# -------------------------------------------------
+# 健康檢查
+# -------------------------------------------------
+@app.get('/')
+def root():
+    return 'OK'
