@@ -33,55 +33,72 @@ def calculate_metrics(portfolio_history: pd.DataFrame,
 
     cagr = (end_value / start_value) ** (1 / years) - 1 if years > 0 else 0
 
-    portfolio_history['peak']      = portfolio_history['value'].cummax()
-    portfolio_history['drawdown']  = (portfolio_history['value'] -
-                                      portfolio_history['peak']) / (portfolio_history['peak'] + EPSILON)
+    # 計算 MDD
+    portfolio_history['peak']     = portfolio_history['value'].cummax()
+    portfolio_history['drawdown'] = (
+        portfolio_history['value'] - portfolio_history['peak']
+    ) / (portfolio_history['peak'] + EPSILON)
     mdd = portfolio_history['drawdown'].min()
 
+    # 日報酬率
     daily_returns = portfolio_history['value'].pct_change().dropna()
     if len(daily_returns) < 2:
         return {'cagr': cagr, 'mdd': mdd, 'volatility': 0,
                 'sharpe_ratio': 0, 'sortino_ratio': 0,
                 'beta': None, 'alpha': None, 'custom_score': 0}
 
-    annual_std              = daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
-    annualized_excess_ret   = cagr - risk_free_rate
-    sharpe_ratio            = annualized_excess_ret / (annual_std + EPSILON)
+    # 年化波動率 & Sharpe
+    annual_std            = daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+    annualized_excess_ret = cagr - risk_free_rate
+    sharpe_ratio          = annualized_excess_ret / (annual_std + EPSILON)
 
-    daily_rf_rate   = (1 + risk_free_rate) ** (1 / TRADING_DAYS_PER_YEAR) - 1
-    downside        = daily_returns - daily_rf_rate
+    # Sortino
+    daily_rf_rate = (1 + risk_free_rate) ** (1 / TRADING_DAYS_PER_YEAR) - 1
+    downside      = daily_returns - daily_rf_rate
     downside[downside > 0] = 0
-    downside_std    = np.sqrt((downside**2).mean()) * np.sqrt(TRADING_DAYS_PER_YEAR)
-    sortino_ratio   = annualized_excess_ret / downside_std if downside_std > EPSILON else 0.0
+    downside_std  = np.sqrt((downside**2).mean()) * np.sqrt(TRADING_DAYS_PER_YEAR)
+    sortino_ratio = (
+        annualized_excess_ret / downside_std
+        if downside_std > EPSILON else 0.0
+    )
 
+    # Beta & Alpha
     beta, alpha = None, None
     if benchmark_history is not None and not benchmark_history.empty:
         bench_ret = benchmark_history['value'].pct_change().dropna()
         aligned   = pd.concat([daily_returns, bench_ret], axis=1, join='inner')
         aligned.columns = ['portfolio', 'benchmark']
         if len(aligned) > 1:
-            cov_matrix         = aligned.cov()
-            covariance         = cov_matrix.iloc[0, 1]
-            benchmark_variance = cov_matrix.iloc[1, 1]
-            if benchmark_variance > EPSILON:
-                beta = covariance / benchmark_variance
-                bench_end = benchmark_history['value'].iloc[-1]
-                bench_st  = benchmark_history['value'].iloc[0]
-                bench_cagr = (bench_end / bench_st) ** (1 / years) - 1 if years > 0 else 0
+            cov_mat         = aligned.cov()
+            covariance      = cov_mat.iloc[0, 1]
+            bench_variance  = cov_mat.iloc[1, 1]
+            if bench_variance > EPSILON:
+                beta       = covariance / bench_variance
+                bench_end  = benchmark_history['value'].iloc[-1]
+                bench_st   = benchmark_history['value'].iloc[0]
+                bench_cagr = (
+                    bench_end / bench_st
+                ) ** (1 / years) - 1 if years > 0 else 0
                 expected_ret = risk_free_rate + beta * (bench_cagr - risk_free_rate)
-                alpha = cagr - expected_ret
+                alpha        = cagr - expected_ret
 
     # 清理非數值
-    sharpe_ratio  = 0.0 if not np.isfinite(sharpe_ratio)  else sharpe_ratio
+    sharpe_ratio  = 0.0 if not np.isfinite(sharpe_ratio) else sharpe_ratio
     sortino_ratio = 0.0 if not np.isfinite(sortino_ratio) else sortino_ratio
-    beta          = None if beta   is not None and not np.isfinite(beta)   else beta
-    alpha         = None if alpha  is not None and not np.isfinite(alpha)  else alpha
+    beta          = None  if beta  is not None and not np.isfinite(beta)  else beta
+    alpha         = None  if alpha is not None and not np.isfinite(alpha) else alpha
 
-    # --- 自訂指標 ----------------------------------------------------------
-    alpha_val   = alpha if alpha is not None else 0.0
+    # 自訂指標
+    alpha_val    = alpha if alpha is not None else 0.0
     custom_score = sortino_ratio * alpha_val * (1 + mdd)
-    # ----------------------------------------------------------------------
 
-    return {'cagr': cagr, 'mdd': mdd, 'volatility': annual_std,
-            'sharpe_ratio': sharpe_ratio, 'sortino_ratio': sortino_ratio,
-            'beta': beta, 'alpha': alpha, 'custom_score': custom_score}
+    return {
+        'cagr': cagr,
+        'mdd': mdd,
+        'volatility': annual_std,
+        'sharpe_ratio': sharpe_ratio,
+        'sortino_ratio': sortino_ratio,
+        'beta': beta,
+        'alpha': alpha,
+        'custom_score': custom_score
+    }
