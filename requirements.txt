@@ -1,3 +1,5 @@
+# requirements.txt
+
 flask
 yfinance
 pandas
@@ -7,3 +9,4 @@ requests
 beautifulsoup4
 lxml
 tqdm
+pyarrow  # <-- 建議加入
