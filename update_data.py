@@ -1,9 +1,8 @@
-# ── update_data.py (Robust version with Fallback) ───────────────
+# ── update_data.py (Robust, ETF-only version) ───────────────────
 # 功能：
-# 1. 主要嘗試從 Wikipedia 抓取 Russell 1000 成分股
-# 2. 若 Wikipedia 失敗，自動切換至備用方案：抓取 IWB ETF 的持股
-# 3. 多執行緒並行下載歷史價格與基本面數據
-# 4. 將所有股價合併為單一、高效的 Parquet 檔案
+# 1. 直接且穩定地抓取 IWB (Russell 1000 ETF) 的持股作為成分股來源
+# 2. 多執行緒並行下載歷史價格與基本面數據
+# 3. 將所有股價合併為單一、高效的 Parquet 檔案
 
 import os
 import json
@@ -25,37 +24,25 @@ MAX_WORKERS = 20
 DATA_DIR.mkdir(exist_ok=True)
 PRICES_DIR.mkdir(exist_ok=True)
 
-def get_russell1000_wikipedia() -> list[str]:
+def get_russell1000_constituents() -> list[str]:
     """
-    主要方法：從 Wikipedia 獲取 Russell 1000 成分股。
-    """
-    try:
-        url = "https://en.wikipedia.org/wiki/Russell_1000_Index"
-        tables = pd.read_html(url)
-        for table in tables:
-            if "Ticker" in table.columns:
-                tickers = table["Ticker"].str.replace(".", "-", regex=False).tolist()
-                print(f"✅ Successfully fetched {len(tickers)} tickers from Wikipedia.")
-                return tickers
-        return []
-    except Exception as e:
-        print(f"🟡 Wikipedia scrape failed: {e}. Will try fallback method.")
-        return []
-
-def get_russell1000_etf_holdings() -> list[str]:
-    """
-    備用方法：如果 Wikipedia 失敗，則抓取 IWB (iShares Russell 1000 ETF) 的持股。
+    透過抓取 IWB (iShares Russell 1000 ETF) 的持股來獲取成分股列表。
+    這是目前最穩定可靠的方法。
     """
     try:
         iwb = yf.Ticker("IWB")
-        holdings = iwb.holdings
+        # 【關鍵修正】使用 .constituents 而不是 .holdings
+        holdings = iwb.constituents
         if holdings is not None and not holdings.empty:
-            tickers = holdings["symbol"].tolist()
-            print(f"✅ Successfully fetched {len(tickers)} tickers from IWB ETF holdings.")
+            # The tickers are in the index of the returned DataFrame
+            tickers = holdings.index.tolist()
+            print(f"✅ Successfully fetched {len(tickers)} tickers from IWB ETF constituents.")
+            # yfinance already provides clean tickers, no need to replace dots
             return tickers
+        print("🔴 Fetched constituents data is empty.")
         return []
     except Exception as e:
-        print(f"🔴 ETF holdings fetch failed: {e}.")
+        print(f"🔴 ETF constituents fetch failed: {e}.")
         return []
 
 def fetch_fundamentals(ticker: str):
@@ -85,14 +72,10 @@ def main():
     """主執行流程"""
     t0 = time.time()
 
-    # 首先嘗試 Wikipedia，如果失敗（返回空列表），則嘗試 ETF 持股
-    tickers = get_russell1000_wikipedia()
-    if not tickers:
-        print("Switching to ETF holdings as a fallback source...")
-        tickers = get_russell1000_etf_holdings()
+    tickers = get_russell1000_constituents()
 
     if not tickers:
-        print("❌ Both primary and fallback methods failed. Aborting update.")
+        print("❌ Failed to fetch constituents. Aborting update.")
         return
 
     # --- 1. Fetch Fundamentals and Price History in Parallel ---
