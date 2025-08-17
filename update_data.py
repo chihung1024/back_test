@@ -1,197 +1,141 @@
-# ── update_data.py（優化完整版本）────────────────────────────
+# ── update_data.py (Focused on Russell 1000) ──────────────────
 # 功能：
-# 1. 抓取 S&P 500 / Nasdaq-100 / Russell 1000 成分股
-# 2. 多執行緒下載基本面與歷史價格
-# 3. 只對下載成功的股票合併 Parquet
-# 4. 若基本面資料與前次相同就跳過寫檔
+# 1. 專門抓取最新的 Russell 1000 成分股
+# 2. 多執行緒並行下載歷史價格與基本面數據
+# 3. 將所有股價合併為單一、高效的 Parquet 檔案
+# 4. 每日更新基本面數據 JSON 檔案
 
-import os, json, time, requests, pandas as pd
+import os
+import json
+import time
+import pandas as pd
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import yfinance as yf
 
-# ─── 資料夾設定 ──────────────────────────────────────────────
-DATA_DIR     = Path("data")
-PRICES_DIR   = DATA_DIR / "prices"
+# --- Configuration ---
+DATA_DIR = Path("data")
+PRICES_DIR = DATA_DIR / "prices"
 PARQUET_FILE = DATA_DIR / "prices.parquet.gz"
-JSON_FILE    = DATA_DIR / "preprocessed_data.json"
-MAX_WORKERS  = 20
+JSON_FILE = DATA_DIR / "preprocessed_data.json"
+MAX_WORKERS = 20
 
+# --- Ensure Directories Exist ---
 DATA_DIR.mkdir(exist_ok=True)
 PRICES_DIR.mkdir(exist_ok=True)
 
-# ─── 1. 取得指數成分股 ───────────────────────────────────────
-def sp500_official() -> list[str]:
-    """直接解析 S&P 官網頁面隱藏的 indexMembers JSON。"""
-    try:
-        html = requests.get(
-            "https://www.spglobal.com/spdji/en/indices/equity/sp-500/#overview",
-            timeout=10
-        ).text
-        i = html.find("indexMembers")
-        if i == -1: return []
-        l = html.find("[", i)
-        r = html.find("]", l) + 1
-        return [m["symbol"] for m in json.loads(html[l:r])]
-    except Exception:
-        return []
-
-def nasdaq_official() -> list[str]:
-    """使用 Nasdaq 官方 JSON API。"""
-    try:
-        hdr = {"User-Agent": "Mozilla/-"}
-        rows = requests.get(
-            "https://api.nasdaq.com/api/quote/NDX/constituents",
-            headers=hdr,
-            timeout=10
-        ).json()["data"]["rows"]
-        return [r["symbol"] for r in rows]
-    except Exception:
-        return []
-
-def wiki_sp500() -> list[str]:
-    try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        return pd.read_html(url)[0]["Symbol"].str.replace(".", "-").tolist()
-    except Exception:
-        return []
-
-def wiki_nasdaq100() -> list[str]:
-    try:
-        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        return pd.read_html(url)[4]["Ticker"].tolist()
-    except Exception:
-        return []
-
-# 【新增】從 Wikipedia 獲取羅素 1000 成分股
-def wiki_russell1000() -> list[str]:
-    """從 Wikipedia 獲取 Russell 1000 成分股。"""
+def get_russell1000() -> list[str]:
+    """
+    從 Wikipedia 獲取最新的 Russell 1000 成分股列表。
+    並自動修正股票代碼格式 (e.g., 'BRK.B' -> 'BRK-B')。
+    """
     try:
         url = "https://en.wikipedia.org/wiki/Russell_1000_Index"
-        # 通常成分股表格是頁面上的第一個或第二個表格
         tables = pd.read_html(url)
-        # 尋找包含 'Ticker' 欄位的表格
         for table in tables:
             if "Ticker" in table.columns:
-                return table["Ticker"].tolist()
+                # 【關鍵修正】替換 '.' 為 '-' 以相容 yfinance
+                tickers = table["Ticker"].str.replace(".", "-", regex=False).tolist()
+                print(f"Successfully fetched {len(tickers)} tickers from Russell 1000 list.")
+                return tickers
+        print("Could not find a table with 'Ticker' column on Wikipedia page.")
         return []
-    except Exception:
+    except Exception as e:
+        print(f"Error fetching Russell 1000 constituents: {e}")
         return []
-
-def get_sp500() -> list[str]:
-    res = sp500_official()
-    return res if res else wiki_sp500()
-
-def get_nasdaq100() -> list[str]:
-    res = nasdaq_official()
-    return res if res else wiki_nasdaq100()
-
-# 【新增】羅素 1000 的主獲取函式
-def get_russell1000() -> list[str]:
-    # 目前只有 wiki 一個來源，但保留此結構以便未來擴充
-    return wiki_russell1000()
-
-# ─── 2. 基本面與歷史價格 ───────────────────────────────────
-BASIC_EXTRA = [
-    "priceToBook", "priceToSalesTrailing12Months", "ebitdaMargins",
-    "grossMargins", "operatingMargins", "debtToEquity"
-]
 
 def fetch_fundamentals(ticker: str):
-    """抓取單檔基本面，失敗回傳 None。"""
+    """抓取單檔基本面數據。"""
     try:
         info = yf.Ticker(ticker).info
-        if not info.get("marketCap"): return None
-        row = {"ticker": ticker, "marketCap": info.get("marketCap"), "sector": info.get("sector"), "trailingPE": info.get("trailingPE"), "forwardPE": info.get("forwardPE"), "dividendYield": info.get("dividendYield"), "returnOnEquity": info.get("returnOnEquity"), "revenueGrowth": info.get("revenueGrowth"), "earningsGrowth": info.get("earningsGrowth")}
-        for k in BASIC_EXTRA:
-            row[k] = info.get(k)
-        return row
+        # 必須有市值才能被納入
+        if not info.get("marketCap"):
+            return None
+        return {
+            "ticker": ticker,
+            "marketCap": info.get("marketCap"),
+            "sector": info.get("sector"),
+            "trailingPE": info.get("trailingPE"),
+            "forwardPE": info.get("forwardPE"),
+            "dividendYield": info.get("dividendYield"),
+            "returnOnEquity": info.get("returnOnEquity"),
+            "revenueGrowth": info.get("revenueGrowth"),
+            "earningsGrowth": info.get("earningsGrowth"),
+            "priceToBook": info.get("priceToBook"),
+            "priceToSalesTrailing12Months": info.get("priceToSalesTrailing12Months"),
+            "operatingMargins": info.get("operatingMargins"),
+        }
     except Exception:
         return None
 
 def fetch_history(ticker: str, max_retries: int = 3, pause_sec: float = 1.0):
-    """下載單檔歷史價格。"""
-    for attempt in range(1, max_retries + 1):
+    """下載單檔股票的歷史價格並存為壓縮 CSV。"""
+    for _ in range(max_retries):
         try:
             df = yf.download(ticker, start="1990-01-01", progress=False, auto_adjust=True)
-            if df.empty or "Close" not in df.columns: raise ValueError("empty frame")
+            if df.empty or "Close" not in df.columns:
+                raise ValueError("Empty or malformed data returned")
+            
             out = df[["Close"]].copy()
             out.index.name = "Date"
-            out.to_csv(PRICES_DIR / f"{ticker}.csv.gz", index_label="Date", compression="gzip")
+            out.to_csv(PRICES_DIR / f"{ticker}.csv.gz", compression="gzip")
             return ticker, True
-        except Exception as e:
-            if attempt == max_retries: return ticker, False
+        except Exception:
             time.sleep(pause_sec)
+    return ticker, False
 
-# ─── 3. 主流程 ───────────────────────────────────────────────
 def main():
+    """主執行流程"""
     t0 = time.time()
 
-    # 【改動】增加羅素 1000
-    sp500_set  = set(get_sp500())
-    ndx_set    = set(get_nasdaq100())
-    russell_set = set(get_russell1000())
-    tickers    = sorted(sp500_set | ndx_set | russell_set) # 合併三個指數的成分股
-
+    tickers = get_russell1000()
     if not tickers:
-        print("❌ 無法取得任何成份股，結束執行"); return
-    print(f"Total unique symbols from S&P 500, Nasdaq-100, and Russell 1000: {len(tickers)}")
+        print("❌ No tickers fetched. Aborting update.")
+        return
 
-    # 3-1 基本面
+    # --- 1. Fetch Fundamentals and Price History in Parallel ---
     fundamentals = []
-    with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        jobs = {ex.submit(fetch_fundamentals, t): t for t in tickers}
-        for fut in tqdm(as_completed(jobs), total=len(jobs), desc="Fundamentals"):
-            data = fut.result()
-            if data: fundamentals.append(data)
+    successful_tickers = set()
 
-    # 【改動】增加 in_russell1000 標籤
-    for row in fundamentals:
-        row["in_sp500"]       = row["ticker"] in sp500_set
-        row["in_nasdaq100"]   = row["ticker"] in ndx_set
-        row["in_russell1000"] = row["ticker"] in russell_set
+    with ThreadPoolExecutor(MAX_WORKERS) as executor:
+        # Submit fundamental fetches
+        future_to_ticker = {executor.submit(fetch_fundamentals, t): t for t in tickers}
+        
+        # Submit history fetches
+        future_to_ticker.update({executor.submit(fetch_history, t): t for t in tickers})
 
-    # 3-2 歷史價格
-    success = set()
-    with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        jobs = {ex.submit(fetch_history, t): t for t in tickers}
-        for fut in tqdm(as_completed(jobs), total=len(jobs), desc="Prices"):
-            tk, ok = fut.result()
-            if ok: success.add(tk)
+        for future in tqdm(as_completed(future_to_ticker), total=len(future_to_ticker), desc="Fetching data"):
+            result = future.result()
+            if isinstance(result, dict) and result:
+                fundamentals.append(result)
+            elif isinstance(result, tuple) and result[1]:
+                successful_tickers.add(result[0])
 
-    # 3-3 合併為單一 Parquet 檔案
-    # 【改動】從 .csv.gz 讀取
+    print(f"\nFetched fundamentals for {len(fundamentals)} tickers.")
+    print(f"Fetched price history for {len(successful_tickers)} tickers.")
+
+    # --- 2. Merge Price Data into a single Parquet file ---
     frames = []
-    print(f"Merging {len(success)} successful price histories into Parquet file...")
-    for tk in tqdm(success, desc="Merging"):
-        csv_path = PRICES_DIR / f"{tk}.csv.gz"
-        if csv_path.exists():
-            df = pd.read_csv(csv_path, index_col="Date", parse_dates=True)
-            if "Close" in df.columns:
+    for tk in tqdm(sorted(list(successful_tickers)), desc="Merging prices"):
+        file_path = PRICES_DIR / f"{tk}.csv.gz"
+        if file_path.exists():
+            df = pd.read_csv(file_path, index_col="Date", parse_dates=True)
+            if not df.empty:
                 frames.append(df["Close"].rename(tk))
 
     if frames:
-        (pd.concat(frames, axis=1)
-           .sort_index()
-           .to_parquet(PARQUET_FILE, compression="gzip"))
+        full_df = pd.concat(frames, axis=1).sort_index()
+        full_df.to_parquet(PARQUET_FILE, compression="gzip")
+        print(f"Successfully merged {len(frames)} tickers into {PARQUET_FILE}")
 
-    # 3-4 基本面變更偵測
-    new_df = pd.DataFrame(fundamentals).sort_values("ticker").reset_index(drop=True)
-    if JSON_FILE.exists():
-        try:
-            old_df = pd.read_json(JSON_FILE, orient="records")
-            # 比較時忽略欄位順序差異
-            if new_df.sort_index(axis=1).equals(old_df.sort_index(axis=1)):
-                print("ℹ️ 基本面無變動，跳過寫檔"); 
-                print(f"✅ 更新檢查完成，耗時 {time.time() - t0:.1f}s")
-                return
-        except Exception:
-            # 如果舊檔案讀取失敗，直接寫入新檔案
-            pass
-
-    new_df.to_json(JSON_FILE, orient="records", indent=2)
-    print(f"✅ 資料更新完成，耗時 {time.time() - t0:.1f}s")
+    # --- 3. Save Fundamentals Data ---
+    if fundamentals:
+        new_df = pd.DataFrame(fundamentals).sort_values("ticker").reset_index(drop=True)
+        new_df.to_json(JSON_FILE, orient="records", indent=2)
+        print(f"Successfully saved fundamental data to {JSON_FILE}")
+        
+    print(f"✅ Data update complete. Total time: {time.time() - t0:.1f} seconds.")
 
 if __name__ == "__main__":
     main()
