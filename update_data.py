@@ -4,6 +4,7 @@
 # 2. 多執行緒下載基本面與歷史價格
 # 3. 只對下載成功的股票合併 Parquet，避免 “KeyError: 'Close'”
 # 4. 若基本面資料與前次相同就跳過寫檔，減少無意義 commit
+# 5. 正規化代碼（BRK.B→BRK-B 等）與後端一致
 
 import os, json, time, requests, pandas as pd
 from pathlib import Path
@@ -12,14 +13,26 @@ from tqdm import tqdm
 import yfinance as yf
 
 # ─── 資料夾設定 ──────────────────────────────────────────────
-DATA_DIR     = Path("data")
-PRICES_DIR   = DATA_DIR / "prices"
+DATA_DIR = Path("data")
+PRICES_DIR = DATA_DIR / "prices"
 PARQUET_FILE = DATA_DIR / "prices.parquet.gz"
-JSON_FILE    = DATA_DIR / "preprocessed_data.json"
-MAX_WORKERS  = 20
+JSON_FILE = DATA_DIR / "preprocessed_data.json"
+MAX_WORKERS = 20
 
 DATA_DIR.mkdir(exist_ok=True)
 PRICES_DIR.mkdir(exist_ok=True)
+
+# ─── 代碼正規化（與後端一致，避免 BRK.B / BF.B 等） ─────────
+def normalize_ticker_for_yahoo(ticker: str) -> str:
+    if not isinstance(ticker, str):
+        return ticker
+    t = ticker.strip()
+    if "." in t:
+        parts = t.split(".")
+        if len(parts) == 2 and parts[1].isalpha():
+            t = parts + "-" + parts[1]
+    t = t.replace(" ", "")
+    return t
 
 # ─── 1. 取得指數成分股 ───────────────────────────────────────
 def sp500_official() -> list[str]:
@@ -60,10 +73,10 @@ def fmp_etf_components(etf: str) -> list[str]:
     if not key:
         return []
     try:
-        url  = f"https://financialmodelingprep.com/api/v3/etf-holder/{etf}?apikey={key}"
+        url = f"https://financialmodelingprep.com/api/v3/etf-holder/{etf}?apikey={key}"
         rows = requests.get(url, timeout=10).json()
         return [
-            row.get("symbol") or row.get("asset")
+            (row.get("symbol") or row.get("asset"))
             for row in rows
             if isinstance(row, dict)
         ]
@@ -81,7 +94,8 @@ def etf_holdings(etf: str) -> list[str]:
 def wiki_sp500() -> list[str]:
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        return pd.read_html(url)[0]["Symbol"].str.replace(".", "-").tolist()
+        # 將 . 改成 - 以符合 Yahoo
+        return pd.read_html(url)[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
     except Exception:
         return []
 
@@ -135,18 +149,15 @@ def fetch_fundamentals(ticker: str):
     except Exception:
         return None
 
-import time
-import yfinance as yf
-
 def fetch_history(ticker: str, max_retries: int = 3, pause_sec: float = 1.0):
     """
     下載單檔歷史價格。
-    成功：回傳 (ticker, True) 且在 data/prices 生成 <ticker>.csv.gz
-    失敗：重試 max_retries 次仍無資料 → 回傳 (ticker, False)
+    成功：回傳 (ticker, True) 並在 data/prices 生成 .csv.gz（僅 Close）
+    失敗：重試後回傳 (ticker, False)
 
-    兩項額外優化：
-    1. 將索引欄命名為 'Date'，避免後續 read_csv(index_col='Date') 時找不到欄名。
-    2. 直接輸出為 gzip 壓縮檔，可將檔案體積縮小 70%–80%。
+    額外：
+    1) 索引命名為 'Date'，利於 read_csv(index_col='Date')
+    2) 輸出 gzip 壓縮
     """
     for attempt in range(1, max_retries + 1):
         try:
@@ -156,41 +167,39 @@ def fetch_history(ticker: str, max_retries: int = 3, pause_sec: float = 1.0):
                 progress=False,
                 auto_adjust=True
             )
-
-            # 檢查必備欄位
             if df.empty or "Close" not in df.columns:
                 raise ValueError("empty frame or no Close column")
 
-            # 只保留收盤價並設定索引欄名稱
             out = df[["Close"]].copy()
             out.index.name = "Date"
-
-            # 儲存為 gzip 壓縮 CSV
             out.to_csv(
                 PRICES_DIR / f"{ticker}.csv.gz",
                 index_label="Date",
                 compression="gzip"
             )
             return ticker, True
-
         except Exception as e:
             if attempt == max_retries:
-                # 最後一次仍失敗 → 回傳 False
                 return ticker, False
-            # 等待後重試
             time.sleep(pause_sec)
-
 
 # ─── 3. 主流程 ───────────────────────────────────────────────
 def main():
     t0 = time.time()
 
-    sp500_set  = set(get_sp500())
-    ndx_set    = set(get_nasdaq100())
-    tickers    = sorted(sp500_set | ndx_set)
+    # 取得指數成分股
+    sp500_list = get_sp500()
+    ndx_list = get_nasdaq100()
+
+    # 正規化代碼並去重
+    sp500_set = set(normalize_ticker_for_yahoo(t) for t in sp500_list if t)
+    ndx_set = set(normalize_ticker_for_yahoo(t) for t in ndx_list if t)
+    tickers = sorted(sp500_set | ndx_set)
 
     if not tickers:
-        print("❌ 無法取得任何成份股，結束執行"); return
+        print("❌ 無法取得任何成份股，結束執行")
+        return
+
     print("Total symbols:", len(tickers))
 
     # 3-1 基本面
@@ -203,10 +212,10 @@ def main():
                 fundamentals.append(data)
 
     for row in fundamentals:
-        row["in_sp500"]     = row["ticker"] in sp500_set
+        row["in_sp500"] = row["ticker"] in sp500_set
         row["in_nasdaq100"] = row["ticker"] in ndx_set
 
-    # 3-2 歷史價格
+    # 3-2 歷史價格（逐檔下載）
     success = set()
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         jobs = {ex.submit(fetch_history, t): t for t in tickers}
@@ -215,25 +224,57 @@ def main():
             if ok:
                 success.add(tk)
 
+    # 3-2-1 合併成功下載的 .csv.gz 為寬表並輸出 Parquet
     frames = []
+    missing_files = 0
     for tk in success:
-        csv_path = PRICES_DIR / f"{tk}.csv"
-        if csv_path.exists():
-            df = pd.read_csv(csv_path, index_col="Date", parse_dates=True)
+        # 注意：fetch_history 輸出的副檔名為 .csv.gz
+        csv_path_gz = PRICES_DIR / f"{tk}.csv.gz"
+        if csv_path_gz.exists():
+            df = pd.read_csv(csv_path_gz, index_col="Date", parse_dates=True)
+            # 僅在確實有 Close 欄位時才納入
             if "Close" in df.columns:
                 frames.append(df["Close"].rename(tk))
+        else:
+            # 相容舊版可能寫成 .csv（不壓縮）
+            csv_path = PRICES_DIR / f"{tk}.csv"
+            if csv_path.exists():
+                df = pd.read_csv(csv_path, index_col="Date", parse_dates=True)
+                if "Close" in df.columns:
+                    frames.append(df["Close"].rename(tk))
+            else:
+                missing_files += 1
 
     if frames:
-        (pd.concat(frames, axis=1)
-           .sort_index()
-           .to_parquet(PARQUET_FILE, compression="gzip"))
+        wide = pd.concat(frames, axis=1).sort_index()
+        # 只在非空時寫檔
+        if not wide.empty:
+            wide.to_parquet(PARQUET_FILE, compression="gzip")
+            print(f"✅ 合併價格完成：{len(wide.columns)} 檔，日期範圍 {wide.index.min().date()} ~ {wide.index.max().date()}")
+        else:
+            print("⚠️ 合併結果為空，跳過寫入 Parquet")
+    else:
+        print("⚠️ 無任何成功的價格檔可合併，跳過 Parquet")
+
+    if missing_files:
+        print(f"ℹ️ 有 {missing_files} 檔下載成功但缺少對應CSV檔（可能是舊檔名或被清理）。")
 
     # 3-3 基本面變更偵測
     new_df = pd.DataFrame(fundamentals).sort_values("ticker").reset_index(drop=True)
     if JSON_FILE.exists():
-        old_df = pd.read_json(JSON_FILE, orient="records")
-        if new_df.equals(old_df):
-            print("ℹ️ 基本面無變動，跳過寫檔"); return
+        try:
+            old_df = pd.read_json(JSON_FILE, orient="records")
+            # 欄位對齊避免 equals 誤判
+            new_df_aligned = new_df.reindex(columns=sorted(new_df.columns))
+            old_df_aligned = old_df.reindex(columns=sorted(old_df.columns))
+            if new_df_aligned.equals(old_df_aligned):
+                print("ℹ️ 基本面無變動，跳過寫檔")
+                elapsed = time.time() - t0
+                print(f"⏱️ 總耗時 {elapsed:.1f}s")
+                return
+        except Exception:
+            # 若舊檔壞損則直接覆蓋
+            pass
 
     new_df.to_json(JSON_FILE, orient="records", indent=2)
     print(f"✅ 更新完成，耗時 {time.time() - t0:.1f}s")
