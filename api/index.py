@@ -143,6 +143,7 @@ def get_price_data(tickers, start_date, end_date) -> pd.DataFrame:
     # 1. 嘗試載入本地快照
     cached_df = load_cached_prices()
     if isinstance(cached_df, pd.DataFrame) and not cached_df.empty:
+        print(">>> 使用 Parquet 快取") 
         # 確保索引能比較
         idx = cached_df.index
         if not isinstance(idx, pd.DatetimeIndex):
@@ -160,6 +161,7 @@ def get_price_data(tickers, start_date, end_date) -> pd.DataFrame:
             
     # 2. 下載不足部分
     if need_dl:
+        print(f">>> 下載 yfinance：{need_dl}")
         dl = download_data_silently(tuple(need_dl), start_date, end_date)
         if isinstance(dl, pd.Series):
             dl = dl.to_frame()
