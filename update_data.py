@@ -1,153 +1,242 @@
-# ── update_data.py (Final Robust Version - Polite Fetching) ───────────
+# ── update_data.py（優化完整版本）────────────────────────────
 # 功能：
-# 1.  穩定地從 iShares 官網 CSV 獲取 Russell 1000 成分股。
-# 2.  自動修正股票代碼格式 (例如 BRK.B -> BRK-B)。
-# 3.  採用循序分批處理，並在批次間加入延遲，以徹底解決速率限制問題。
-# 4.  修正了並行處理中的 Bug，確保數據能被穩定下載。
+# 1. 先抓官方 S&P 500 / Nasdaq-100 成分；失敗改用 FMP；再失敗回 ETF / Wiki
+# 2. 多執行緒下載基本面與歷史價格
+# 3. 只對下載成功的股票合併 Parquet，避免 “KeyError: 'Close'”
+# 4. 若基本面資料與前次相同就跳過寫檔，減少無意義 commit
 
-import os
-import json
-import time
-import pandas as pd
+import os, json, time, requests, pandas as pd
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import yfinance as yf
-import requests
-from io import StringIO
 
-# --- Configuration ---
-DATA_DIR = Path("data")
-PRICES_DIR = DATA_DIR / "prices"
+# ─── 資料夾設定 ──────────────────────────────────────────────
+DATA_DIR     = Path("data")
+PRICES_DIR   = DATA_DIR / "prices"
 PARQUET_FILE = DATA_DIR / "prices.parquet.gz"
-JSON_FILE = DATA_DIR / "preprocessed_data.json"
-MAX_WORKERS = 15
-BATCH_SIZE = 100  # Process 100 tickers at a time
-DELAY_BETWEEN_BATCHES = 5  # Wait 5 seconds between batches
+JSON_FILE    = DATA_DIR / "preprocessed_data.json"
+MAX_WORKERS  = 20
 
-# --- Ensure Directories Exist ---
 DATA_DIR.mkdir(exist_ok=True)
 PRICES_DIR.mkdir(exist_ok=True)
 
-def get_russell1000_constituents() -> list[str]:
-    """
-    直接從 iShares 官網下載 IWB ETF 持股 CSV，並修正股票代碼。
-    """
+# ─── 1. 取得指數成分股 ───────────────────────────────────────
+def sp500_official() -> list[str]:
+    """直接解析 S&P 官網頁面隱藏的 indexMembers JSON。"""
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        url = "https://www.ishares.com/us/products/239707/ishares-russell-1000-etf/1467271812596.ajax?fileType=csv&fileName=IWB_holdings&dataType=fund"
-        
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-
-        content = response.text
-        if 'Ticker' not in content:
-            raise ValueError("CSV content does not contain 'Ticker' header.")
-
-        csv_data = StringIO(content[content.find('Ticker'):])
-        df = pd.read_csv(csv_data)
-        
-        df_stocks = df[df['Asset Class'] == 'Equity'].copy()
-        
-        # 【關鍵修正】自動將 'BRK.B' 轉換為 'BRK-B'
-        tickers = df_stocks['Ticker'].dropna().str.replace('.', '-', regex=False).unique().tolist()
-        
-        print(f"✅ Successfully fetched and sanitized {len(tickers)} stock tickers.")
-        return tickers
-        
-    except Exception as e:
-        print(f"🔴 Failed to download or parse iShares holdings CSV: {e}")
+        html = requests.get(
+            "https://www.spglobal.com/spdji/en/indices/equity/sp-500/#overview",
+            timeout=10
+        ).text
+        i = html.find("indexMembers")
+        if i == -1:
+            return []
+        l = html.find("[", i)
+        r = html.find("]", l) + 1
+        return [m["symbol"] for m in json.loads(html[l:r])]
+    except Exception:
         return []
 
-def fetch_history_for_ticker(ticker):
-    """下載單一股票的歷史數據。"""
+def nasdaq_official() -> list[str]:
+    """使用 Nasdaq 官方 JSON API。"""
     try:
-        df = yf.download(ticker, start="1990-01-01", progress=False, auto_adjust=True)
-        if df.empty or "Close" not in df.columns:
-            return None
-        df.index.name = "Date"
-        df[['Close']].to_csv(PRICES_DIR / f"{ticker}.csv.gz", compression="gzip")
-        return ticker
+        hdr = {"User-Agent": "Mozilla/5.0"}
+        rows = requests.get(
+            "https://api.nasdaq.com/api/quote/NDX/constituents",
+            headers=hdr,
+            timeout=10
+        ).json()["data"]["rows"]
+        return [r["symbol"] for r in rows]
     except Exception:
-        return None
+        return []
 
-def fetch_fundamentals_for_ticker(ticker):
-    """下載單一股票的基本面數據。"""
+def fmp_etf_components(etf: str) -> list[str]:
+    """
+    以 FMP API 當備援來源：
+    https://financialmodelingprep.com/api/v3/etf-holder/{etf}
+    """
+    key = os.getenv("FMP_TOKEN")
+    if not key:
+        return []
+    try:
+        url  = f"https://financialmodelingprep.com/api/v3/etf-holder/{etf}?apikey={key}"
+        rows = requests.get(url, timeout=10).json()
+        return [
+            row.get("symbol") or row.get("asset")
+            for row in rows
+            if isinstance(row, dict)
+        ]
+    except Exception:
+        return []
+
+def etf_holdings(etf: str) -> list[str]:
+    """最後備援：直接看 ETF 成份。"""
+    try:
+        hold = yf.Ticker(etf).holdings
+        return hold["symbol"].tolist() if hold is not None else []
+    except Exception:
+        return []
+
+def wiki_sp500() -> list[str]:
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        return pd.read_html(url)[0]["Symbol"].str.replace(".", "-").tolist()
+    except Exception:
+        return []
+
+def wiki_nasdaq100() -> list[str]:
+    try:
+        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+        return pd.read_html(url)[4]["Ticker"].tolist()
+    except Exception:
+        return []
+
+def get_sp500() -> list[str]:
+    for fn in (sp500_official, lambda: fmp_etf_components("VOO")):
+        res = fn()
+        if res:
+            return res
+    return etf_holdings("VOO") or wiki_sp500()
+
+def get_nasdaq100() -> list[str]:
+    for fn in (nasdaq_official, lambda: fmp_etf_components("QQQ")):
+        res = fn()
+        if res:
+            return res
+    return etf_holdings("QQQ") or wiki_nasdaq100()
+
+# ─── 2. 基本面與歷史價格 ───────────────────────────────────
+BASIC_EXTRA = [
+    "priceToBook", "priceToSalesTrailing12Months", "ebitdaMargins",
+    "grossMargins", "operatingMargins", "debtToEquity"
+]
+
+def fetch_fundamentals(ticker: str):
+    """抓取單檔基本面，失敗回傳 None。"""
     try:
         info = yf.Ticker(ticker).info
-        if info and info.get("marketCap"):
-            return { "ticker": ticker, "marketCap": info.get("marketCap"), "sector": info.get("sector"), "trailingPE": info.get("trailingPE"), "forwardPE": info.get("forwardPE"), "dividendYield": info.get("dividendYield") }
+        if not info.get("marketCap"):
+            return None
+        row = {
+            "ticker": ticker,
+            "marketCap": info.get("marketCap"),
+            "sector": info.get("sector"),
+            "trailingPE": info.get("trailingPE"),
+            "forwardPE": info.get("forwardPE"),
+            "dividendYield": info.get("dividendYield"),
+            "returnOnEquity": info.get("returnOnEquity"),
+            "revenueGrowth": info.get("revenueGrowth"),
+            "earningsGrowth": info.get("earningsGrowth"),
+        }
+        for k in BASIC_EXTRA:
+            row[k] = info.get(k)
+        return row
     except Exception:
         return None
 
+import time
+import yfinance as yf
+
+def fetch_history(ticker: str, max_retries: int = 3, pause_sec: float = 1.0):
+    """
+    下載單檔歷史價格。
+    成功：回傳 (ticker, True) 且在 data/prices 生成 <ticker>.csv.gz
+    失敗：重試 max_retries 次仍無資料 → 回傳 (ticker, False)
+
+    兩項額外優化：
+    1. 將索引欄命名為 'Date'，避免後續 read_csv(index_col='Date') 時找不到欄名。
+    2. 直接輸出為 gzip 壓縮檔，可將檔案體積縮小 70%–80%。
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            df = yf.download(
+                ticker,
+                start="1990-01-01",
+                progress=False,
+                auto_adjust=True
+            )
+
+            # 檢查必備欄位
+            if df.empty or "Close" not in df.columns:
+                raise ValueError("empty frame or no Close column")
+
+            # 只保留收盤價並設定索引欄名稱
+            out = df[["Close"]].copy()
+            out.index.name = "Date"
+
+            # 儲存為 gzip 壓縮 CSV
+            out.to_csv(
+                PRICES_DIR / f"{ticker}.csv.gz",
+                index_label="Date",
+                compression="gzip"
+            )
+            return ticker, True
+
+        except Exception as e:
+            if attempt == max_retries:
+                # 最後一次仍失敗 → 回傳 False
+                return ticker, False
+            # 等待後重試
+            time.sleep(pause_sec)
+
+
+# ─── 3. 主流程 ───────────────────────────────────────────────
 def main():
-    """主執行流程"""
     t0 = time.time()
-    tickers = get_russell1000_constituents()
+
+    sp500_set  = set(get_sp500())
+    ndx_set    = set(get_nasdaq100())
+    tickers    = sorted(sp500_set | ndx_set)
 
     if not tickers:
-        print("❌ Failed to fetch constituents. Aborting update.")
-        return
+        print("❌ 無法取得任何成份股，結束執行"); return
+    print("Total symbols:", len(tickers))
 
-    all_successful_histories = []
-    all_fundamentals = []
-    
-    ticker_batches = [tickers[i:i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
+    # 3-1 基本面
+    fundamentals = []
+    with ThreadPoolExecutor(MAX_WORKERS) as ex:
+        jobs = {ex.submit(fetch_fundamentals, t): t for t in tickers}
+        for fut in tqdm(as_completed(jobs), total=len(jobs), desc="Fundamentals"):
+            data = fut.result()
+            if data:
+                fundamentals.append(data)
 
-    print(f"Starting to process {len(tickers)} tickers in {len(ticker_batches)} batches.")
+    for row in fundamentals:
+        row["in_sp500"]     = row["ticker"] in sp500_set
+        row["in_nasdaq100"] = row["ticker"] in ndx_set
 
-    for i, batch in enumerate(ticker_batches):
-        print(f"\n--- Processing Batch {i+1}/{len(ticker_batches)} ---")
-        with ThreadPoolExecutor(MAX_WORKERS) as executor:
-            # Fetch history
-            future_hist = {executor.submit(fetch_history_for_ticker, t): t for t in batch}
-            for future in tqdm(as_completed(future_hist), total=len(batch), desc="History"):
-                result = future.result()
-                if result:
-                    all_successful_histories.append(result)
-            
-            # Fetch fundamentals
-            future_fund = {executor.submit(fetch_fundamentals_for_ticker, t): t for t in batch}
-            for future in tqdm(as_completed(future_fund), total=len(batch), desc="Fundamentals"):
-                result = future.result()
-                if result:
-                    all_fundamentals.append(result)
+    # 3-2 歷史價格
+    success = set()
+    with ThreadPoolExecutor(MAX_WORKERS) as ex:
+        jobs = {ex.submit(fetch_history, t): t for t in tickers}
+        for fut in tqdm(as_completed(jobs), total=len(jobs), desc="Prices"):
+            tk, ok = fut.result()
+            if ok:
+                success.add(tk)
 
-        if i < len(ticker_batches) - 1:
-            print(f"--- Batch {i+1} complete. Waiting for {DELAY_BETWEEN_BATCHES} seconds... ---")
-            time.sleep(DELAY_BETWEEN_BATCHES)
-
-    print(f"\n\n--- All batches processed ---")
-    print(f"Fetched fundamentals for {len(all_fundamentals)} tickers.")
-    print(f"Fetched price history for {len(all_successful_histories)} tickers.")
-
-    # --- Merge Price Data ---
     frames = []
-    for tk in tqdm(sorted(all_successful_histories), desc="Merging Prices"):
-        file_path = PRICES_DIR / f"{tk}.csv.gz"
-        if file_path.exists():
-            try:
-                df = pd.read_csv(file_path, index_col="Date", parse_dates=True)
-                if not df.empty:
-                    frames.append(df["Close"].rename(tk))
-            except Exception as e:
-                print(f"Warning: Could not read or process file for {tk}. Skipping. Error: {e}")
-                continue
+    for tk in success:
+        csv_path = PRICES_DIR / f"{tk}.csv"
+        if csv_path.exists():
+            df = pd.read_csv(csv_path, index_col="Date", parse_dates=True)
+            if "Close" in df.columns:
+                frames.append(df["Close"].rename(tk))
 
     if frames:
-        full_df = pd.concat(frames, axis=1).sort_index()
-        full_df.to_parquet(PARQUET_FILE, compression="gzip")
-        print(f"✅ Successfully merged {len(frames)} tickers into {PARQUET_FILE}")
+        (pd.concat(frames, axis=1)
+           .sort_index()
+           .to_parquet(PARQUET_FILE, compression="gzip"))
 
-    # --- Save Fundamentals Data ---
-    if all_fundamentals:
-        new_df = pd.DataFrame(all_fundamentals).sort_values("ticker").reset_index(drop=True)
-        new_df.to_json(JSON_FILE, orient="records", indent=2)
-        print(f"✅ Successfully saved fundamental data to {JSON_FILE}")
-        
-    print(f"✅ Data update complete. Total time: {time.time() - t0:.1f} seconds.")
+    # 3-3 基本面變更偵測
+    new_df = pd.DataFrame(fundamentals).sort_values("ticker").reset_index(drop=True)
+    if JSON_FILE.exists():
+        old_df = pd.read_json(JSON_FILE, orient="records")
+        if new_df.equals(old_df):
+            print("ℹ️ 基本面無變動，跳過寫檔"); return
+
+    new_df.to_json(JSON_FILE, orient="records", indent=2)
+    print(f"✅ 更新完成，耗時 {time.time() - t0:.1f}s")
 
 if __name__ == "__main__":
     main()
