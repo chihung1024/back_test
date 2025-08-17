@@ -1,11 +1,7 @@
-# requirements.txt
+# requirements.txt (精簡後，用於 Vercel 部署)
 flask
-yfinance
 pandas
 numpy
 cachetools
 requests
-beautifulsoup4
-lxml
-tqdm
 pyarrow
