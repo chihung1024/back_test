@@ -1,9 +1,8 @@
 name: Update Stock Data
-
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 8 * * *'  # 每日 08:00 UTC
+    - cron: '0 8 * * *'   # 每日 08:00 UTC
 
 permissions:
   contents: write
@@ -11,51 +10,31 @@ permissions:
 jobs:
   update-data:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install -U pip wheel
+      - run: |
+          python -m pip install -U pip
           pip install -r requirements.txt
-
-      - name: Run updater
-        env:
+      - env:
           FMP_TOKEN: ${{ secrets.FMP_TOKEN }}
-        run: |
-          python update_data.py
+        run: python update_data.py
 
       - name: Commit & push (only when changed)
         run: |
           git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-
-          # 使用臨時分支承載更新，以避免對預設分支歷史造成頻繁commit
+          git config --local user.name  "GitHub Action"
           git checkout -b temp-data-branch
-
-          # 僅強制加入 data 目錄的內容（含 parquet、json、csv.gz）
           git add -f data/
-
-          # 若無檔案變動則跳過
           if git diff --staged --quiet; then
             echo "No change – skip commit."
             exit 0
           fi
-
-          # 顯示目前狀態（除錯用，可保留）
-          git status
-
           git commit -m "chore: auto-update data $(date -u +'%F')"
-          # 將臨時分支 push 至遠端的 data 分支
           git push -f origin temp-data-branch:data
 
-      - name: Git maintenance (optional)
-        run: |
-          git gc --prune=now --aggressive
+      - run: git gc --prune=now --aggressive
