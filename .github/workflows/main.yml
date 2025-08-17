@@ -1,39 +1,40 @@
 name: Update Stock Data
-
 on:
-  workflow_dispatch: # 允許手動觸發
+  workflow_dispatch:
   schedule:
-    - cron: '0 8 * * *' # 每日 08:00 UTC 執行
+    - cron: '0 8 * * *'   # 每日 08:00 UTC
 
 permissions:
-  contents: write # 需要寫入權限來推送數據到 gh-pages 分支
+  contents: write
 
 jobs:
   update-data:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
-        run: |
+      - run: |
           python -m pip install -U pip
           pip install -r requirements.txt
-
-      - name: Run data update script
-        env:
-          FMP_TOKEN: ${{ secrets.FMP_TOKEN }} # 從 GitHub Secrets 獲取 FMP API Token
+      - env:
+          FMP_TOKEN: ${{ secrets.FMP_TOKEN }}
         run: python update_data.py
 
-      - name: Deploy data to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }} # GitHub Pages 需要此 token 來推送內容
-          publish_dir: ./data # 指定要發佈的目錄，即 update_data.py 生成數據的目錄
-          force_orphan: true # 確保 gh-pages 分支只包含最新數據，清除舊的歷史記錄
-          # cname: stockdata.yourdomain.com # 如果你有自定義域名，可以在此配置
+      - name: Commit & push (only when changed)
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name  "GitHub Action"
+          git checkout -b temp-data-branch
+          git add -f data/
+          if git diff --staged --quiet; then
+            echo "No change – skip commit."
+            exit 0
+          fi
+          git commit -m "chore: auto-update data $(date -u +'%F')"
+          git push -f origin temp-data-branch:data
+
+      - run: git gc --prune=now --aggressive
