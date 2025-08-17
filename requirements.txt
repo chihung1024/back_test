@@ -1,3 +1,4 @@
+# requirements.txt (完整版，用於 Render/Heroku)
 flask
 yfinance
 pandas
@@ -7,3 +8,5 @@ requests
 beautifulsoup4
 lxml
 tqdm
+pyarrow
+gunicorn  # <-- 新增這一行
