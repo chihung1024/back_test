@@ -135,34 +135,39 @@ def download_data_silently(tickers, start_date, end_date):
 
 def get_price_data(tickers, start_date, end_date) -> pd.DataFrame:
     """
-    優先使用 Parquet，缺資料再向 yfinance 抓取。
+    先讀 Parquet，若缺資料或檔案異常則回退 yfinance。
     """
-    need_download = set(tickers)
-    frames = []
+    need_dl = set(tickers)
+    parts = []
 
+    # 1. 嘗試載入本地快照
     cached_df = load_cached_prices()
-    if cached_df is not None:
-        # 確保索引為 DatetimeIndex；若轉型失敗會被剃除
-        if not isinstance(cached_df.index, pd.DatetimeIndex):
-            cached_df.index = pd.to_datetime(cached_df.index, errors="coerce")
-            cached_df = cached_df[~cached_df.index.isna()]
+    if isinstance(cached_df, pd.DataFrame) and not cached_df.empty:
+        # 確保索引能比較
+        idx = cached_df.index
+        if not isinstance(idx, pd.DatetimeIndex):
+            idx = pd.to_datetime(idx, errors="coerce")
+        cached_df = cached_df.set_index(idx)      # ← 複製後重新賦值，避開 read-only
+        cached_df = cached_df[~cached_df.index.isna()]
 
         mask = (cached_df.index >= start_date) & (cached_df.index <= end_date)
         subset = cached_df.loc[mask]
 
-        if not subset.empty:
-            present = need_download & set(subset.columns)
-            if present:
-                frames.append(subset[present])
-                need_download -= present
+        present = need_dl & set(subset.columns)
+        if present:
+            parts.append(subset[present])
+            need_dl -= present  # 剩下才往 yfinance 抓
+            
+    # 2. 下載不足部分
+    if need_dl:
+        dl = download_data_silently(tuple(need_dl), start_date, end_date)
+        if isinstance(dl, pd.Series):
+            dl = dl.to_frame()
+        parts.append(dl)
 
-    if need_download:
-        dl_df = download_data_silently(tuple(need_download), start_date, end_date)
-        if isinstance(dl_df, pd.Series):
-            dl_df = dl_df.to_frame()
-        frames.append(dl_df)
+    # 3. 合併結果
+    return pd.concat(parts, axis=1).sort_index() if parts else pd.DataFrame()
 
-    return pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
 
 
 
