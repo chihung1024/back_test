@@ -183,6 +183,54 @@ def fetch_history(ticker: str, max_retries: int = 3, pause_sec: float = 1.0):
                 return ticker, False
             time.sleep(pause_sec)
 
+def load_close_series(path: Path, ticker: str):
+    """
+    讀取單一 CSV/CSV.GZ，盡可能容錯：
+    - 嘗試以 index_col="Date" 讀取（理想狀態）
+    - 若失敗，改用 index_col=0 並將第一欄解析為日期
+    - 強制尋找 Close 欄（大小寫容忍），若不存在則回傳 None
+    回傳：Series（name=ticker，DatetimeIndex），或 None
+    """
+    if not path.exists():
+        return None
+    try:
+        # 嘗試正常讀法：有 Date 欄名且 parse_dates=True
+        df = pd.read_csv(path, index_col="Date", parse_dates=True)
+    except Exception:
+        # 回退：以第一欄當索引，並嘗試 parse_dates
+        df = pd.read_csv(path, header=0)
+        # 如果第一欄不是日期名，強制把第一欄當索引並解析日期
+        if df.shape[1] >= 2:
+            df = df.set_index(df.columns)
+        # 解析日期索引
+        try:
+            df.index = pd.to_datetime(df.index)
+        except Exception:
+            return None
+
+    # 統一尋找 Close 欄（容忍大小寫）
+    close_col = None
+    for c in df.columns:
+        if str(c).lower() == "close":
+            close_col = c
+            break
+    if close_col is None:
+        # 有些檔案只有單欄（無標題），可嘗試第一欄
+        if df.shape[1] == 1:
+            close_col = df.columns
+        else:
+            return None
+
+    s = df[close_col].copy()
+    # 去除空值並排序
+    s = s.dropna()
+    if s.empty:
+        return None
+    s.index.name = "Date"
+    s.name = ticker
+    return s
+
+
 # ─── 3. 主流程 ───────────────────────────────────────────────
 def main():
     t0 = time.time()
@@ -225,39 +273,38 @@ def main():
                 success.add(tk)
 
     # 3-2-1 合併成功下載的 .csv.gz 為寬表並輸出 Parquet
-    frames = []
-    missing_files = 0
-    for tk in success:
-        # 注意：fetch_history 輸出的副檔名為 .csv.gz
-        csv_path_gz = PRICES_DIR / f"{tk}.csv.gz"
-        if csv_path_gz.exists():
-            df = pd.read_csv(csv_path_gz, index_col="Date", parse_dates=True)
-            # 僅在確實有 Close 欄位時才納入
-            if "Close" in df.columns:
-                frames.append(df["Close"].rename(tk))
-        else:
-            # 相容舊版可能寫成 .csv（不壓縮）
-            csv_path = PRICES_DIR / f"{tk}.csv"
-            if csv_path.exists():
-                df = pd.read_csv(csv_path, index_col="Date", parse_dates=True)
-                if "Close" in df.columns:
-                    frames.append(df["Close"].rename(tk))
-            else:
-                missing_files += 1
+frames = []
+missing_files = 0
 
-    if frames:
-        wide = pd.concat(frames, axis=1).sort_index()
-        # 只在非空時寫檔
-        if not wide.empty:
-            wide.to_parquet(PARQUET_FILE, compression="gzip")
-            print(f"✅ 合併價格完成：{len(wide.columns)} 檔，日期範圍 {wide.index.min().date()} ~ {wide.index.max().date()}")
-        else:
-            print("⚠️ 合併結果為空，跳過寫入 Parquet")
+for tk in success:
+    # 優先讀 .csv.gz；若不存在再讀 .csv
+    csv_path_gz = PRICES_DIR / f"{tk}.csv.gz"
+    csv_path = PRICES_DIR / f"{tk}.csv"
+
+    s = None
+    if csv_path_gz.exists():
+        s = load_close_series(csv_path_gz, tk)
+    elif csv_path.exists():
+        s = load_close_series(csv_path, tk)
     else:
-        print("⚠️ 無任何成功的價格檔可合併，跳過 Parquet")
+        missing_files += 1
 
-    if missing_files:
-        print(f"ℹ️ 有 {missing_files} 檔下載成功但缺少對應CSV檔（可能是舊檔名或被清理）。")
+    if s is not None and not s.empty:
+        frames.append(s)
+
+if frames:
+    wide = pd.concat(frames, axis=1).sort_index()
+    if not wide.empty:
+        wide.to_parquet(PARQUET_FILE, compression="gzip")
+        print(f"✅ 合併價格完成：{len(wide.columns)} 檔，日期範圍 {wide.index.min().date()} ~ {wide.index.max().date()}")
+    else:
+        print("⚠️ 合併結果為空，跳過寫入 Parquet")
+else:
+    print("⚠️ 無任何成功的價格檔可合併，跳過 Parquet")
+
+if missing_files:
+    print(f"ℹ️ 有 {missing_files} 檔下載成功但缺少對應CSV檔（可能是舊檔名或被清理）。")
+
 
     # 3-3 基本面變更偵測
     new_df = pd.DataFrame(fundamentals).sort_values("ticker").reset_index(drop=True)
