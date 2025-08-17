@@ -1,8 +1,8 @@
-# ── update_data.py (Robust, ETF-only version) ───────────────────
+# ── update_data.py (最終穩定版 - 直接下載官方 CSV) ─────────────
 # 功能：
-# 1. 直接且穩定地抓取 IWB (Russell 1000 ETF) 的持股作為成分股來源
-# 2. 多執行緒並行下載歷史價格與基本面數據
-# 3. 將所有股價合併為單一、高效的 Parquet 檔案
+# 1. 透過直接下載 iShares 官網的 CSV 檔案，穩定獲取 IWB (Russell 1000 ETF) 的持股。
+# 2. 多執行緒並行下載歷史價格與基本面數據。
+# 3. 將所有股價合併為單一、高效的 Parquet 檔案。
 
 import os
 import json
@@ -12,6 +12,8 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import yfinance as yf
+import requests
+from io import StringIO
 
 # --- Configuration ---
 DATA_DIR = Path("data")
@@ -24,25 +26,42 @@ MAX_WORKERS = 20
 DATA_DIR.mkdir(exist_ok=True)
 PRICES_DIR.mkdir(exist_ok=True)
 
-def get_russell1000_constituents() -> list[str]:
+def get_russell1000_constituents_from_ishares() -> list[str]:
     """
-    透過抓取 IWB (iShares Russell 1000 ETF) 的持股來獲取成分股列表。
-    這是目前最穩定可靠的方法。
+    直接從 iShares (BlackRock) 官網下載 IWB ETF 的持股 CSV 檔案。
+    這是最穩定和官方的方法。
     """
     try:
-        iwb = yf.Ticker("IWB")
-        # 【關鍵修正】使用 .constituents 而不是 .holdings
-        holdings = iwb.constituents
-        if holdings is not None and not holdings.empty:
-            # The tickers are in the index of the returned DataFrame
-            tickers = holdings.index.tolist()
-            print(f"✅ Successfully fetched {len(tickers)} tickers from IWB ETF constituents.")
-            # yfinance already provides clean tickers, no need to replace dots
-            return tickers
-        print("🔴 Fetched constituents data is empty.")
-        return []
+        # 偽裝成瀏覽器以避免被阻擋
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        # iShares 提供的 IWB 持股 CSV 下載連結
+        url = "https://www.ishares.com/us/products/239707/ishares-russell-1000-etf/1467271812596.ajax?fileType=csv&fileName=IWB_holdings&dataType=fund"
+        
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()  # 如果請求失敗則拋出錯誤
+
+        # 讀取 CSV 內容，跳過 iShares CSV 檔案開頭的說明文字
+        # 我們透過尋找 "Ticker" 這個詞來確定表格的起始位置
+        content = response.text
+        if 'Ticker' not in content:
+            raise ValueError("CSV content does not contain 'Ticker' header.")
+
+        # 將從 "Ticker" 開始的內容讀入 pandas DataFrame
+        csv_data = StringIO(content[content.find('Ticker'):])
+        df = pd.read_csv(csv_data)
+        
+        # 篩選掉現金等非股票資產
+        df_stocks = df[df['Asset Class'] == 'Equity'].copy()
+        
+        tickers = df_stocks['Ticker'].dropna().unique().tolist()
+        
+        print(f"✅ Successfully fetched {len(tickers)} stock tickers from iShares official CSV.")
+        return tickers
+        
     except Exception as e:
-        print(f"🔴 ETF constituents fetch failed: {e}.")
+        print(f"🔴 Failed to download or parse iShares holdings CSV: {e}")
         return []
 
 def fetch_fundamentals(ticker: str):
@@ -72,13 +91,13 @@ def main():
     """主執行流程"""
     t0 = time.time()
 
-    tickers = get_russell1000_constituents()
+    tickers = get_russell1000_constituents_from_ishares()
 
     if not tickers:
         print("❌ Failed to fetch constituents. Aborting update.")
         return
 
-    # --- 1. Fetch Fundamentals and Price History in Parallel ---
+    # --- 後續流程不變 ---
     fundamentals, successful_tickers = [], set()
     with ThreadPoolExecutor(MAX_WORKERS) as executor:
         future_to_ticker = {executor.submit(fetch_fundamentals, t): t for t in tickers}
@@ -93,7 +112,6 @@ def main():
     print(f"\nFetched fundamentals for {len(fundamentals)} tickers.")
     print(f"Fetched price history for {len(successful_tickers)} tickers.")
 
-    # --- 2. Merge Price Data into a single Parquet file ---
     frames = []
     for tk in tqdm(sorted(list(successful_tickers)), desc="Merging prices"):
         file_path = PRICES_DIR / f"{tk}.csv.gz"
@@ -107,7 +125,6 @@ def main():
         full_df.to_parquet(PARQUET_FILE, compression="gzip")
         print(f"Successfully merged {len(frames)} tickers into {PARQUET_FILE}")
 
-    # --- 3. Save Fundamentals Data ---
     if fundamentals:
         new_df = pd.DataFrame(fundamentals).sort_values("ticker").reset_index(drop=True)
         new_df.to_json(JSON_FILE, orient="records", indent=2)
