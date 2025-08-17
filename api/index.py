@@ -135,19 +135,20 @@ def download_data_silently(tickers, start_date, end_date):
 
 def get_price_data(tickers, start_date, end_date) -> pd.DataFrame:
     """
-    優先讀取 Parquet；缺欄或缺日期再補抓遠端。回傳 DataFrame (日期×ticker)。
+    優先讀取 Parquet；缺欄或缺日期再補抓遠端。
     """
     need_download = set(tickers)
-    final_frames = []
+    frames = []
 
     cached_df = load_cached_prices()
     if cached_df is not None:
+        cached_df.index = pd.to_datetime(cached_df.index)  # ← NEW
         mask = (cached_df.index >= start_date) & (cached_df.index <= end_date)
         subset = cached_df.loc[mask]
         if not subset.empty:
             present = need_download & set(subset.columns)
             if present:
-                final_frames.append(subset[present])
+                frames.append(subset[present])
                 need_download -= present
 
     if need_download:
