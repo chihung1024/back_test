@@ -1,9 +1,9 @@
-# ── update_data.py (Focused on Russell 1000) ──────────────────
+# ── update_data.py (Robust version with Fallback) ───────────────
 # 功能：
-# 1. 專門抓取最新的 Russell 1000 成分股
-# 2. 多執行緒並行下載歷史價格與基本面數據
-# 3. 將所有股價合併為單一、高效的 Parquet 檔案
-# 4. 每日更新基本面數據 JSON 檔案
+# 1. 主要嘗試從 Wikipedia 抓取 Russell 1000 成分股
+# 2. 若 Wikipedia 失敗，自動切換至備用方案：抓取 IWB ETF 的持股
+# 3. 多執行緒並行下載歷史價格與基本面數據
+# 4. 將所有股價合併為單一、高效的 Parquet 檔案
 
 import os
 import json
@@ -25,47 +25,45 @@ MAX_WORKERS = 20
 DATA_DIR.mkdir(exist_ok=True)
 PRICES_DIR.mkdir(exist_ok=True)
 
-def get_russell1000() -> list[str]:
+def get_russell1000_wikipedia() -> list[str]:
     """
-    從 Wikipedia 獲取最新的 Russell 1000 成分股列表。
-    並自動修正股票代碼格式 (e.g., 'BRK.B' -> 'BRK-B')。
+    主要方法：從 Wikipedia 獲取 Russell 1000 成分股。
     """
     try:
         url = "https://en.wikipedia.org/wiki/Russell_1000_Index"
         tables = pd.read_html(url)
         for table in tables:
             if "Ticker" in table.columns:
-                # 【關鍵修正】替換 '.' 為 '-' 以相容 yfinance
                 tickers = table["Ticker"].str.replace(".", "-", regex=False).tolist()
-                print(f"Successfully fetched {len(tickers)} tickers from Russell 1000 list.")
+                print(f"✅ Successfully fetched {len(tickers)} tickers from Wikipedia.")
                 return tickers
-        print("Could not find a table with 'Ticker' column on Wikipedia page.")
         return []
     except Exception as e:
-        print(f"Error fetching Russell 1000 constituents: {e}")
+        print(f"🟡 Wikipedia scrape failed: {e}. Will try fallback method.")
+        return []
+
+def get_russell1000_etf_holdings() -> list[str]:
+    """
+    備用方法：如果 Wikipedia 失敗，則抓取 IWB (iShares Russell 1000 ETF) 的持股。
+    """
+    try:
+        iwb = yf.Ticker("IWB")
+        holdings = iwb.holdings
+        if holdings is not None and not holdings.empty:
+            tickers = holdings["symbol"].tolist()
+            print(f"✅ Successfully fetched {len(tickers)} tickers from IWB ETF holdings.")
+            return tickers
+        return []
+    except Exception as e:
+        print(f"🔴 ETF holdings fetch failed: {e}.")
         return []
 
 def fetch_fundamentals(ticker: str):
     """抓取單檔基本面數據。"""
     try:
         info = yf.Ticker(ticker).info
-        # 必須有市值才能被納入
-        if not info.get("marketCap"):
-            return None
-        return {
-            "ticker": ticker,
-            "marketCap": info.get("marketCap"),
-            "sector": info.get("sector"),
-            "trailingPE": info.get("trailingPE"),
-            "forwardPE": info.get("forwardPE"),
-            "dividendYield": info.get("dividendYield"),
-            "returnOnEquity": info.get("returnOnEquity"),
-            "revenueGrowth": info.get("revenueGrowth"),
-            "earningsGrowth": info.get("earningsGrowth"),
-            "priceToBook": info.get("priceToBook"),
-            "priceToSalesTrailing12Months": info.get("priceToSalesTrailing12Months"),
-            "operatingMargins": info.get("operatingMargins"),
-        }
+        if not info.get("marketCap"): return None
+        return { "ticker": ticker, "marketCap": info.get("marketCap"), "sector": info.get("sector"), "trailingPE": info.get("trailingPE"), "forwardPE": info.get("forwardPE"), "dividendYield": info.get("dividendYield"), "returnOnEquity": info.get("returnOnEquity"), "revenueGrowth": info.get("revenueGrowth"), "earningsGrowth": info.get("earningsGrowth"), "priceToBook": info.get("priceToBook"), "priceToSalesTrailing12Months": info.get("priceToSalesTrailing12Months"), "operatingMargins": info.get("operatingMargins"), }
     except Exception:
         return None
 
@@ -74,9 +72,7 @@ def fetch_history(ticker: str, max_retries: int = 3, pause_sec: float = 1.0):
     for _ in range(max_retries):
         try:
             df = yf.download(ticker, start="1990-01-01", progress=False, auto_adjust=True)
-            if df.empty or "Close" not in df.columns:
-                raise ValueError("Empty or malformed data returned")
-            
+            if df.empty or "Close" not in df.columns: raise ValueError("Empty data")
             out = df[["Close"]].copy()
             out.index.name = "Date"
             out.to_csv(PRICES_DIR / f"{ticker}.csv.gz", compression="gzip")
@@ -89,22 +85,21 @@ def main():
     """主執行流程"""
     t0 = time.time()
 
-    tickers = get_russell1000()
+    # 首先嘗試 Wikipedia，如果失敗（返回空列表），則嘗試 ETF 持股
+    tickers = get_russell1000_wikipedia()
     if not tickers:
-        print("❌ No tickers fetched. Aborting update.")
+        print("Switching to ETF holdings as a fallback source...")
+        tickers = get_russell1000_etf_holdings()
+
+    if not tickers:
+        print("❌ Both primary and fallback methods failed. Aborting update.")
         return
 
     # --- 1. Fetch Fundamentals and Price History in Parallel ---
-    fundamentals = []
-    successful_tickers = set()
-
+    fundamentals, successful_tickers = [], set()
     with ThreadPoolExecutor(MAX_WORKERS) as executor:
-        # Submit fundamental fetches
         future_to_ticker = {executor.submit(fetch_fundamentals, t): t for t in tickers}
-        
-        # Submit history fetches
         future_to_ticker.update({executor.submit(fetch_history, t): t for t in tickers})
-
         for future in tqdm(as_completed(future_to_ticker), total=len(future_to_ticker), desc="Fetching data"):
             result = future.result()
             if isinstance(result, dict) and result:
