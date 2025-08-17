@@ -3,411 +3,404 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from pandas.tseries.offsets import BDay, MonthEnd
-import sys, os, time
+import sys
+import os
 from io import StringIO
-from pathlib import Path
 from cachetools import cached, TTLCache
 import requests
+from pathlib import Path
 
 app = Flask(__name__)
 
-# ── 全域常數 ───────────────────────────────────────────
+# --- 全域常數 ---
 RISK_FREE_RATE = 0
 TRADING_DAYS_PER_YEAR = 252
 DAYS_PER_YEAR = 365.25
 EPSILON = 1e-9
 
-# ── 快取 ──────────────────────────────────────────────
-cache = TTLCache(maxsize=128, ttl=600)  # 10 分鐘
+# --- 快取設定 ---
+cache = TTLCache(maxsize=128, ttl=600)
 
-# ── 環境變數 ──────────────────────────────────────────
-GIST_RAW_URL = os.environ.get("GIST_RAW_URL")
+# --- [CRITICAL] 從環境變數讀取 Gist Raw URL ---
+GIST_RAW_URL = os.environ.get('GIST_RAW_URL')
 
-# ── 本地 Parquet（由 GitHub Action 更新）──────────────
-PARQUET_FILE = Path("data/prices.parquet.gz")
+# --- 資料庫（Parquet）設定 ---
+PARQUET_PATH = Path("data/prices.parquet.gz")
 
-# ── ── ── 輔助：載入本地快取價格 ──────────────────────
-@cached(cache)
-def load_cached_prices() -> pd.DataFrame | None:
+# --- 代碼正規化（避免 BRK.B 等與資料庫/雅虎不一致） ---
+def normalize_ticker_for_yahoo(ticker: str) -> str:
+    if not isinstance(ticker, str):
+        return ticker
+    t = ticker.strip()
+    if "." in t:
+        parts = t.split(".")
+        if len(parts) == 2 and parts[1].isalpha():
+            t = parts + "-" + parts[1]
+    t = t.replace(" ", "")
+    return t
+
+# --- 資料庫讀取輔助 ---
+def load_prices_from_db(tickers, start_date, end_date):
     """
-    讀取 GitHub Action 預先匯出的歷史收盤價 Parquet。
-    回傳 DataFrame，rows 為日期，columns 為 ticker；若檔案不存在回傳 None。
+    從 data/prices.parquet.gz 讀取指定 tickers 與日期區間的收盤價寬表
+    回傳 DataFrame: index=DatetimeIndex, columns=要求之 tickers 的子集
+    若檔案不存在或無法讀取，回傳 None
     """
-    if PARQUET_FILE.exists():
-        return pd.read_parquet(PARQUET_FILE)
-    return None
+    try:
+        if not PARQUET_PATH.exists():
+            return None
+        df = pd.read_parquet(PARQUET_PATH)  # 寬表，欄為 Ticker
+        # 安全處理：只取需要的欄位，忽略不存在者
+        exist = [t for t in tickers if t in df.columns]
+        if not exist:
+            return pd.DataFrame(index=df.index)  # 空欄，但有日期索引
+        subset = df[exist].copy()
+        subset.index = pd.to_datetime(subset.index)
+        subset = subset.loc[(subset.index >= pd.to_datetime(start_date)) & (subset.index <= pd.to_datetime(end_date))]
+        subset = subset.sort_index()
+        return subset
+    except Exception as e:
+        print(f"[load_prices_from_db] error: {e}")
+        return None
 
-
-# ── ── ── 計算績效指標 ────────────────────────────────
+# --- 核心計算函式 ---
 def calculate_metrics(portfolio_history, benchmark_history=None, risk_free_rate=RISK_FREE_RATE):
     if portfolio_history.empty or len(portfolio_history) < 2:
-        return {"cagr": 0, "mdd": 0, "volatility": 0, "sharpe_ratio": 0, "sortino_ratio": 0, "beta": None, "alpha": None}
+        return {'cagr': 0, 'mdd': 0, 'volatility': 0, 'sharpe_ratio': 0, 'sortino_ratio': 0, 'beta': None, 'alpha': None}
 
-    end_value = portfolio_history["value"].iloc[-1]
-    start_value = portfolio_history["value"].iloc[0]
+    end_value = portfolio_history['value'].iloc[-1]
+    start_value = portfolio_history['value'].iloc[0]
     if start_value < EPSILON:
-        return {"cagr": 0, "mdd": -1, "volatility": 0, "sharpe_ratio": 0, "sortino_ratio": 0, "beta": None, "alpha": None}
+        return {'cagr': 0, 'mdd': -1, 'volatility': 0, 'sharpe_ratio': 0, 'sortino_ratio': 0, 'beta': None, 'alpha': None}
 
-    start_date = portfolio_history.index[0]
+    start_date = portfolio_history.index
     end_date = portfolio_history.index[-1]
     years = (end_date - start_date).days / DAYS_PER_YEAR
     cagr = (end_value / start_value) ** (1 / years) - 1 if years > 0 else 0
 
-    portfolio_history["peak"] = portfolio_history["value"].cummax()
-    portfolio_history["drawdown"] = (portfolio_history["value"] - portfolio_history["peak"]) / (portfolio_history["peak"] + EPSILON)
-    mdd = portfolio_history["drawdown"].min()
+    portfolio_history = portfolio_history.copy()
+    portfolio_history['peak'] = portfolio_history['value'].cummax()
+    portfolio_history['drawdown'] = (portfolio_history['value'] - portfolio_history['peak']) / (portfolio_history['peak'] + EPSILON)
+    mdd = portfolio_history['drawdown'].min()
 
-    daily_returns = portfolio_history["value"].pct_change().dropna()
+    daily_returns = portfolio_history['value'].pct_change().dropna()
     if len(daily_returns) < 2:
-        return {"cagr": cagr, "mdd": mdd, "volatility": 0, "sharpe_ratio": 0, "sortino_ratio": 0, "beta": None, "alpha": None}
+        return {'cagr': cagr, 'mdd': mdd, 'volatility': 0, 'sharpe_ratio': 0, 'sortino_ratio': 0, 'beta': None, 'alpha': None}
 
     annual_std = daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
     annualized_excess_return = cagr - risk_free_rate
     sharpe_ratio = annualized_excess_return / (annual_std + EPSILON)
 
-    daily_risk_free_rate = (1 + risk_free_rate) ** (1 / TRADING_DAYS_PER_YEAR) - 1
+    daily_risk_free_rate = (1 + risk_free_rate)**(1/TRADING_DAYS_PER_YEAR) - 1
     downside_returns = daily_returns - daily_risk_free_rate
     downside_returns[downside_returns > 0] = 0
     downside_std = np.sqrt((downside_returns**2).mean()) * np.sqrt(TRADING_DAYS_PER_YEAR)
-    sortino_ratio = annualized_excess_return / downside_std if downside_std > EPSILON else 0.0
+
+    sortino_ratio = 0.0
+    if downside_std > EPSILON:
+        sortino_ratio = annualized_excess_return / downside_std
 
     beta, alpha = None, None
     if benchmark_history is not None and not benchmark_history.empty:
-        benchmark_returns = benchmark_history["value"].pct_change().dropna()
-        aligned_returns = pd.concat([daily_returns, benchmark_returns], axis=1, join="inner")
-        aligned_returns.columns = ["portfolio", "benchmark"]
+        benchmark_returns = benchmark_history['value'].pct_change().dropna()
+        aligned_returns = pd.concat([daily_returns, benchmark_returns], axis=1, join='inner')
+        aligned_returns.columns = ['portfolio', 'benchmark']
         if len(aligned_returns) > 1:
-            cov_matrix = aligned_returns.cov()
-            covariance = cov_matrix.iloc[0, 1]
-            bench_var = cov_matrix.iloc[1, 1]
-            if bench_var > EPSILON:
-                beta = covariance / bench_var
-                bench_end_val = benchmark_history["value"].iloc[-1]
-                bench_start_val = benchmark_history["value"].iloc[0]
-                bench_cagr = (bench_end_val / bench_start_val) ** (1 / years) - 1 if years > 0 else 0
+            covariance_matrix = aligned_returns.cov()
+            covariance = covariance_matrix.iloc[0, 1]
+            benchmark_variance = covariance_matrix.iloc[1, 1]
+            if benchmark_variance > EPSILON:
+                beta = covariance / benchmark_variance
+
+                bench_end_value = benchmark_history['value'].iloc[-1]
+                bench_start_value = benchmark_history['value'].iloc[0]
+                bench_cagr = (bench_end_value / bench_start_value) ** (1 / years) - 1 if years > 0 else 0
                 expected_return = risk_free_rate + beta * (bench_cagr - risk_free_rate)
                 alpha = cagr - expected_return
 
-    # 清洗無限與 NaN
-    for k in ("sharpe_ratio", "sortino_ratio"):
-        if not np.isfinite(locals()[k]) or np.isnan(locals()[k]):
-            locals()[k] = 0.0
-    for k in ("beta", "alpha"):
-        if locals()[k] is not None and (not np.isfinite(locals()[k]) or np.isnan(locals()[k])):
-            locals()[k] = None
+    if not np.isfinite(sharpe_ratio) or np.isnan(sharpe_ratio): sharpe_ratio = 0.0
+    if not np.isfinite(sortino_ratio) or np.isnan(sortino_ratio): sortino_ratio = 0.0
+    if beta is not None and (not np.isfinite(beta) or np.isnan(beta)): beta = None
+    if alpha is not None and (not np.isfinite(alpha) or np.isnan(alpha)): alpha = None
 
-    return {
-        "cagr": cagr,
-        "mdd": mdd,
-        "volatility": annual_std,
-        "sharpe_ratio": sharpe_ratio,
-        "sortino_ratio": sortino_ratio,
-        "beta": beta,
-        "alpha": alpha,
-    }
+    return {'cagr': cagr, 'mdd': mdd, 'volatility': annual_std, 'sharpe_ratio': sharpe_ratio, 'sortino_ratio': sortino_ratio, 'beta': beta, 'alpha': alpha}
 
+def run_simulation(portfolio_config, price_data, initial_amount, benchmark_history=None):
+    tickers = portfolio_config['tickers']
+    weights = np.array(portfolio_config['weights']) / 100.0
+    rebalancing_period = portfolio_config['rebalancingPeriod']
 
-# ── ── ── 下載（或本地讀取）股價 ───────────────────────
+    df_prices = price_data[tickers].copy()
+    if df_prices.empty: return None
+
+    portfolio_history = pd.Series(index=df_prices.index, dtype=float, name="value")
+    rebalancing_dates = get_rebalancing_dates(df_prices, rebalancing_period)
+
+    current_date = df_prices.index[0]
+    initial_prices = df_prices.loc[current_date]
+    shares = (initial_amount * weights) / (initial_prices + EPSILON)
+    portfolio_history.loc[current_date] = initial_amount
+
+    for i in range(1, len(df_prices)):
+        current_date = df_prices.index[i]
+        current_prices = df_prices.loc[current_date]
+        current_value = (shares * current_prices).sum()
+        portfolio_history.loc[current_date] = current_value
+
+        if current_date in rebalancing_dates:
+            shares = (current_value * weights) / (current_prices + EPSILON)
+
+    portfolio_history = portfolio_history.dropna()
+    metrics = calculate_metrics(portfolio_history.to_frame('value'), benchmark_history)
+    return {'name': portfolio_config['name'], **metrics, 'portfolioHistory': [{'date': date.strftime('%Y-%m-%d'), 'value': value} for date, value in portfolio_history.items()]}
+
+# --- 輔助函式 ---
+def get_rebalancing_dates(df_prices, period):
+    if period == 'never': return []
+    df = df_prices.copy()
+    df['year'] = df.index.year
+    df['month'] = df.index.month
+    if period == 'annually':
+        rebalance_dates = df.drop_duplicates(subset=['year'], keep='first').index
+    elif period == 'quarterly':
+        df['quarter'] = df.index.quarter
+        rebalance_dates = df.drop_duplicates(subset=['year', 'quarter'], keep='first').index
+    elif period == 'monthly':
+        rebalance_dates = df.drop_duplicates(subset=['year', 'month'], keep='first').index
+    else:
+        return []
+    return rebalance_dates[1:] if len(rebalance_dates) > 1 else []
+
+def validate_data_completeness(df_prices_raw, all_tickers, requested_start_date):
+    problematic_tickers = []
+    for ticker in all_tickers:
+        if ticker in df_prices_raw.columns:
+            first_valid_date = df_prices_raw[ticker].first_valid_index()
+            if first_valid_date is not None and first_valid_date > requested_start_date + BDay(5):
+                problematic_tickers.append({'ticker': ticker, 'start_date': first_valid_date.strftime('%Y-%m-%d')})
+    return problematic_tickers
+
+# 仍保留 yfinance 的靜默下載，供可選 fallback 使用
 @cached(cache)
 def download_data_silently(tickers, start_date, end_date):
-    """
-    從 yfinance 批次下載 Close 價 (自動調整)。傳入 tickers 為 tuple。
-    透過 stdout 重導避免 noisy progress bar。
-    """
-    old_stdout = sys.stdout
-    sys.stdout = StringIO()
+    old_stdout = sys.stdout; sys.stdout = StringIO()
     try:
+        chunks = [tickers[i:i+15] for i in range(0, len(tickers), 15)]
         dfs = []
-        for i in range(0, len(tickers), 15):
-            part = yf.download(
-                list(tickers[i : i + 15]),
-                start=start_date,
-                end=end_date,
-                auto_adjust=True,
-                progress=False,
-            )["Close"]
+        for c in chunks:
+            part = yf.download(list(c), start=start_date, end=end_date, auto_adjust=True, progress=False)['Close']
             dfs.append(part)
         data = pd.concat(dfs, axis=1)
     finally:
         sys.stdout = old_stdout
     return data
 
+# --- API 端點 ---
 
-def get_price_data(tickers, start_date, end_date) -> pd.DataFrame:
-    """
-    先讀 Parquet，若缺資料或檔案異常則回退 yfinance。
-    """
-    need_dl = set(tickers)
-    parts = []
-
-    # 1. 嘗試載入本地快照
-    cached_df = load_cached_prices()
-    if isinstance(cached_df, pd.DataFrame) and not cached_df.empty:
-        print(">>> 使用 Parquet 快取") 
-        # 確保索引能比較
-        idx = cached_df.index
-        if not isinstance(idx, pd.DatetimeIndex):
-            idx = pd.to_datetime(idx, errors="coerce")
-        cached_df = cached_df.set_index(idx)      # ← 複製後重新賦值，避開 read-only
-        cached_df = cached_df[~cached_df.index.isna()]
-
-        mask = (cached_df.index >= start_date) & (cached_df.index <= end_date)
-        subset = cached_df.loc[mask]
-
-        present = need_dl & set(subset.columns)
-        if present:
-            parts.append(subset[present])
-            need_dl -= present  # 剩下才往 yfinance 抓
-            
-    # 2. 下載不足部分
-    if need_dl:
-        print(f">>> 下載 yfinance：{need_dl}")
-        dl = download_data_silently(tuple(need_dl), start_date, end_date)
-        if isinstance(dl, pd.Series):
-            dl = dl.to_frame()
-        parts.append(dl)
-
-    # 3. 合併結果
-    return pd.concat(parts, axis=1).sort_index() if parts else pd.DataFrame()
-
-
-
-
-# ── ── ── 回測核心 ───────────────────────────────────────
-def get_rebalancing_dates(df_prices, period):
-    if period == "never":
-        return []
-    df = df_prices.copy()
-    df["year"] = df.index.year
-    df["month"] = df.index.month
-    if period == "annually":
-        rebal_dates = df.drop_duplicates(subset=["year"], keep="first").index
-    elif period == "quarterly":
-        df["quarter"] = df.index.quarter
-        rebal_dates = df.drop_duplicates(subset=["year", "quarter"], keep="first").index
-    elif period == "monthly":
-        rebal_dates = df.drop_duplicates(subset=["year", "month"], keep="first").index
-    else:
-        return []
-    return rebal_dates[1:] if len(rebal_dates) > 1 else []
-
-
-def validate_data_completeness(df_prices_raw, all_tickers, requested_start_date):
-    problematic = []
-    for tk in all_tickers:
-        if tk in df_prices_raw.columns:
-            first_valid = df_prices_raw[tk].first_valid_index()
-            if first_valid is not None and first_valid > requested_start_date + BDay(5):
-                problematic.append({"ticker": tk, "start_date": first_valid.strftime("%Y-%m-%d")})
-    return problematic
-
-
-def run_simulation(portfolio_config, price_data, initial_amount, benchmark_history=None):
-    tickers = portfolio_config["tickers"]
-    weights = np.array(portfolio_config["weights"]) / 100.0
-    rebalancing_period = portfolio_config["rebalancingPeriod"]
-
-    df_prices = price_data[tickers].copy()
-    if df_prices.empty:
-        return None
-
-    portfolio_history = pd.Series(index=df_prices.index, dtype=float, name="value")
-    rebal_dates = get_rebalancing_dates(df_prices, rebalancing_period)
-
-    current_date = df_prices.index[0]
-    shares = (initial_amount * weights) / (df_prices.loc[current_date] + EPSILON)
-    portfolio_history.loc[current_date] = initial_amount
-
-    for i in range(1, len(df_prices)):
-        current_date = df_prices.index[i]
-        current_value = (shares * df_prices.loc[current_date]).sum()
-        portfolio_history.loc[current_date] = current_value
-        if current_date in rebal_dates:
-            shares = (current_value * weights) / (df_prices.loc[current_date] + EPSILON)
-
-    portfolio_history.dropna(inplace=True)
-    metrics = calculate_metrics(portfolio_history.to_frame("value"), benchmark_history)
-    history_pairs = [{"date": d.strftime("%Y-%m-%d"), "value": v} for d, v in portfolio_history.items()]
-    return {"name": portfolio_config["name"], **metrics, "portfolioHistory": history_pairs}
-
-
-# ── ── ── API：/api/backtest ──────────────────────────────
-@app.route("/api/backtest", methods=["POST"])
+@app.route('/api/backtest', methods=['POST'])
 def backtest_handler():
     try:
         data = request.get_json()
         start_date_str = f"{data['startYear']}-{data['startMonth']}-01"
         end_date = pd.to_datetime(f"{data['endYear']}-{data['endMonth']}-01") + MonthEnd(0)
-        end_date_str = end_date.strftime("%Y-%m-%d")
+        end_date_str = end_date.strftime('%Y-%m-%d')
 
-        all_tickers = {tk for p in data["portfolios"] for tk in p["tickers"]}
-        benchmark_tk = data.get("benchmark")
-        if benchmark_tk:
-            all_tickers.add(benchmark_tk)
-        if not all_tickers:
-            return jsonify({"error": "請至少在一個投資組合中設定一項資產。"}), 400
+        # 正規化 ticker
+        all_tickers = set(normalize_ticker_for_yahoo(t) for p in data['portfolios'] for t in p['tickers'])
+        benchmark_ticker = data.get('benchmark')
+        if benchmark_ticker:
+            benchmark_ticker = normalize_ticker_for_yahoo(benchmark_ticker)
+            all_tickers.add(benchmark_ticker)
 
-        price_df = get_price_data(tuple(sorted(all_tickers)), start_date_str, end_date_str)
-        if price_df.empty or price_df.isnull().all().any():
-            return jsonify({"error": "無法取得完整價格資料。"}), 400
+        all_tickers_tuple = tuple(sorted(list(all_tickers)))
+        if not all_tickers_tuple:
+            return jsonify({'error': '請至少在一個投資組合中設定一項資產。'}), 400
 
-        warn = None
-        probs = validate_data_completeness(price_df, all_tickers, pd.to_datetime(start_date_str))
-        if probs:
-            tk_str = ", ".join([f"{p['ticker']} (從 {p['start_date']} 開始)" for p in probs])
-            warn = f"部分資產的數據起始日晚於您的選擇。回測已自動調整至最早的共同可用日期：{tk_str}"
+        # 優先從資料庫讀
+        df_prices_raw = load_prices_from_db(all_tickers_tuple, start_date_str, end_date_str)
 
-        price_df = price_df.dropna()
-        if price_df.empty:
-            return jsonify({"error": "在指定的時間範圍內找不到共同交易日。"}), 400
+        USE_FALLBACK_YFIN = False  # 若想在庫內無資料時回退，即改 True
+        if (df_prices_raw is None) or df_prices_raw.empty:
+            if USE_FALLBACK_YFIN:
+                df_prices_raw = download_data_silently(all_tickers_tuple, start_date_str, end_date_str)
+                if isinstance(df_prices_raw, pd.Series):
+                    df_prices_raw = df_prices_raw.to_frame(name=all_tickers_tuple[0])
+            else:
+                return jsonify({'error': '資料庫在指定期間內無任何可用股價，請先執行資料更新或縮短期間。'}), 400
 
-        initial_amount = float(data["initialAmount"])
-        benchmark_result, bench_history = None, None
-        if benchmark_tk and benchmark_tk in price_df.columns:
-            bench_conf = {"name": benchmark_tk, "tickers": [benchmark_tk], "weights": [100], "rebalancingPeriod": "never"}
-            benchmark_result = run_simulation(bench_conf, price_df, initial_amount)
+        if isinstance(df_prices_raw, pd.Series):
+            df_prices_raw = df_prices_raw.to_frame(name=all_tickers_tuple)
+
+        if df_prices_raw.isnull().all().any():
+            failed_tickers = df_prices_raw.columns[df_prices_raw.isnull().all()].tolist()
+            return jsonify({'error': f"無法獲取以下股票代碼的數據: {', '.join(failed_tickers)}"}), 400
+
+        problematic_tickers_info = validate_data_completeness(df_prices_raw, all_tickers_tuple, pd.to_datetime(start_date_str))
+        warning_message = None
+        if problematic_tickers_info:
+            tickers_str = ", ".join([f"{item['ticker']} (從 {item['start_date']} 開始)" for item in problematic_tickers_info])
+            warning_message = f"部分資產的數據起始日晚於您的選擇。回測已自動調整至最早的共同可用日期。週期受影響的資產：{tickers_str}"
+
+        df_prices_common = df_prices_raw.dropna()
+        if df_prices_common.empty:
+            return jsonify({'error': '在指定的時間範圍內，找不到所有股票的共同交易日。'}), 400
+
+        initial_amount = float(data['initialAmount'])
+
+        benchmark_result = None
+        benchmark_history = None
+        if benchmark_ticker and benchmark_ticker in df_prices_common.columns:
+            benchmark_config = {'name': benchmark_ticker, 'tickers': [benchmark_ticker], 'weights': [100], 'rebalancingPeriod': 'never'}
+            benchmark_result = run_simulation(benchmark_config, df_prices_common, initial_amount)
             if benchmark_result:
-                bench_history = (
-                    pd.DataFrame(benchmark_result["portfolioHistory"]).set_index("date").astype({"value": float})
-                )
-                bench_history.index = pd.to_datetime(bench_history.index)
+                benchmark_history = pd.DataFrame(benchmark_result['portfolioHistory']).set_index('date')
+                benchmark_history.index = pd.to_datetime(benchmark_history.index)
 
         results = []
-        for p_conf in data["portfolios"]:
-            if not p_conf["tickers"]:
+        for p_config in data['portfolios']:
+            if not p_config['tickers']:
                 continue
-            res = run_simulation(p_conf, price_df, initial_amount, bench_history)
+            # 替換成正規化後的 tickers
+            p_config = p_config.copy()
+            p_config['tickers'] = [normalize_ticker_for_yahoo(t) for t in p_config['tickers']]
+            res = run_simulation(p_config, df_prices_common, initial_amount, benchmark_history)
             if res:
                 results.append(res)
 
         if not results:
-            return jsonify({"error": "沒有足夠的共同交易日來進行回測。"}), 400
+            return jsonify({'error': '沒有足夠的共同交易日來進行回測。'}), 400
 
         if benchmark_result:
-            benchmark_result["beta"] = 1.0
-            benchmark_result["alpha"] = 0.0
-            benchmark_result.update(calculate_metrics(bench_history))
+            benchmark_result['beta'] = 1.0
+            benchmark_result['alpha'] = 0.00
+            temp_metrics = calculate_metrics(benchmark_history)
+            benchmark_result.update(temp_metrics)
 
-        return jsonify({"data": results, "benchmark": benchmark_result, "warning": warn})
+        return jsonify({'data': results, 'benchmark': benchmark_result, 'warning': warning_message})
     except Exception as e:
-        import traceback
+        import traceback; print(traceback.format_exc())
+        return jsonify({'error': f'伺服器發生未預期的錯誤: {str(e)}'}), 500
 
-        print(traceback.format_exc())
-        return jsonify({"error": f"伺服器錯誤: {e}"}), 500
-
-
-# ── ── ── API：/api/scan ─────────────────────────────────
-@app.route("/api/scan", methods=["POST"])
+@app.route('/api/scan', methods=['POST'])
 def scan_handler():
     try:
         data = request.get_json()
-        tickers = data["tickers"]
-        benchmark_tk = data.get("benchmark")
-        if not tickers:
-            return jsonify({"error": "股票代碼列表不可為空。"}), 400
+        tickers = [normalize_ticker_for_yahoo(t) for t in data['tickers']]
+        benchmark_ticker = normalize_ticker_for_yahoo(data.get('benchmark')) if data.get('benchmark') else None
 
         start_date_str = f"{data['startYear']}-{data['startMonth']}-01"
         end_date = pd.to_datetime(f"{data['endYear']}-{data['endMonth']}-01") + MonthEnd(0)
-        end_date_str = end_date.strftime("%Y-%m-%d")
+        end_date_str = end_date.strftime('%Y-%m-%d')
 
-        all_tk = set(tickers)
-        if benchmark_tk:
-            all_tk.add(benchmark_tk)
+        if not tickers:
+            return jsonify({'error': '股票代碼列表不可為空。'}), 400
 
-        price_df = get_price_data(tuple(sorted(all_tk)), start_date_str, end_date_str)
-        if price_df.empty:
-            return jsonify({"error": "無法取得價格資料"}), 400
+        all_tickers_to_download = set(tickers)
+        if benchmark_ticker:
+            all_tickers_to_download.add(benchmark_ticker)
+        all_tickers_tuple = tuple(sorted(list(all_tickers_to_download)))
 
-        bench_hist = None
-        if benchmark_tk and benchmark_tk in price_df.columns:
-            bench_prices = price_df[[benchmark_tk]].dropna()
-            if not bench_prices.empty:
-                bench_hist = bench_prices.rename(columns={benchmark_tk: "value"})
+        # 優先從資料庫讀
+        df_prices_raw = load_prices_from_db(all_tickers_tuple, start_date_str, end_date_str)
+
+        USE_FALLBACK_YFIN = False  # 若想在庫內無資料時回退，即改 True
+        if (df_prices_raw is None) or df_prices_raw.empty:
+            if USE_FALLBACK_YFIN:
+                df_prices_raw = download_data_silently(all_tickers_tuple, start_date_str, end_date_str)
+                if isinstance(df_prices_raw, pd.Series):
+                    df_prices_raw = df_prices_raw.to_frame(name=all_tickers_tuple[0])
+            else:
+                return jsonify({'error': '資料庫在指定期間內無任何可用股價，請先執行資料更新或縮短期間。'}), 400
+
+        if isinstance(df_prices_raw, pd.Series):
+            df_prices_raw = df_prices_raw.to_frame(name=all_tickers_tuple)
+
+        benchmark_history = None
+        if benchmark_ticker and benchmark_ticker in df_prices_raw.columns:
+            benchmark_prices = df_prices_raw[[benchmark_ticker]].dropna()
+            if not benchmark_prices.empty:
+                benchmark_history = benchmark_prices.rename(columns={benchmark_ticker: 'value'})
 
         results = []
-        req_start = pd.to_datetime(start_date_str)
-        for tk in tickers:
-            if tk not in price_df.columns:
-                results.append({"ticker": tk, "error": "找不到數據"})
-                continue
+        requested_start_date = pd.to_datetime(start_date_str)
+        available_tickers = df_prices_raw.columns.tolist() if hasattr(df_prices_raw, 'columns') else [df_prices_raw.name]
 
-            series = price_df[tk].dropna()
-            if series.empty:
-                results.append({"ticker": tk, "error": "指定範圍內無數據"})
-                continue
+        for ticker in tickers:
+            try:
+                if ticker not in available_tickers:
+                    results.append({'ticker': ticker, 'error': '找不到數據'})
+                    continue
 
-            note = None
-            prob = validate_data_completeness(price_df, [tk], req_start)
-            if prob:
-                note = f"(從 {prob[0]['start_date']} 開始)"
+                stock_prices = df_prices_raw[ticker].dropna()
+                if stock_prices.empty:
+                    results.append({'ticker': ticker, 'error': '指定範圍內無數據'})
+                    continue
 
-            metrics = calculate_metrics(series.to_frame("value"), bench_hist)
-            results.append({"ticker": tk, **metrics, "note": note})
+                note = None
+                problematic_info = validate_data_completeness(df_prices_raw, [ticker], requested_start_date)
+                if problematic_info:
+                    note = f"(從 {problematic_info[0]['start_date']} 開始)"
+
+                history_df = stock_prices.to_frame(name='value')
+                metrics = calculate_metrics(history_df, benchmark_history)
+                results.append({'ticker': ticker, **metrics, 'note': note})
+            except Exception as e:
+                print(f"處理 {ticker} 時發生錯誤: {e}")
+                results.append({'ticker': ticker, 'error': '計算錯誤'})
 
         return jsonify(results)
     except Exception as e:
-        import traceback
+        import traceback; print(traceback.format_exc())
+        return jsonify({'error': f'伺服器發生未預期的錯誤: {str(e)}'}), 500
 
-        print(traceback.format_exc())
-        return jsonify({"error": f"伺服器錯誤: {e}"}), 500
-
-
-# ── ── ── API：/api/screener ────────────────────────────
 @cached(cache)
 def get_preprocessed_data():
+    """從 Gist 下載並快取預處理好的數據"""
     if not GIST_RAW_URL:
-        raise ValueError("GIST_RAW_URL 環境變數未設定")
-    resp = requests.get(GIST_RAW_URL, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+        raise ValueError("錯誤：GIST_RAW_URL 環境變數未設定。請在 Vercel 專案設定中新增此變數。")
+    response = requests.get(GIST_RAW_URL)
+    response.raise_for_status()
+    return response.json()
 
-
-@app.route("/api/screener", methods=["POST"])
+@app.route('/api/screener', methods=['POST'])
 def screener_handler():
     try:
         data = request.get_json()
-        index = data.get("index", "sp500")
-        min_mc = data.get("minMarketCap", 0)
-        sector = data.get("sector", "any")
+        index = data.get('index', 'sp500')
+        min_market_cap = data.get('minMarketCap', 0)
+        sector = data.get('sector', 'any')
 
         all_stocks = get_preprocessed_data()
-        if index == "sp500":
-            base = [s for s in all_stocks if s.get("in_sp500")]
-        elif index == "nasdaq100":
-            base = [s for s in all_stocks if s.get("in_nasdaq100")]
-        elif index == "russell3000":
-            base = [s for s in all_stocks if s.get("in_russell3000")]
+
+        if index == 'sp500':
+            base_pool = [s for s in all_stocks if s.get('in_sp500')]
+        elif index == 'nasdaq100':
+            base_pool = [s for s in all_stocks if s.get('in_nasdaq100')]
+        elif index == 'russell3000':
+            base_pool = [s for s in all_stocks if s.get('in_russell3000')]
         else:
-            base = all_stocks
+            base_pool = all_stocks
 
-        filt = []
-        for s in base:
-            if s.get("marketCap", 0) < min_mc:
+        filtered_stocks = []
+        for stock in base_pool:
+            if stock.get('marketCap', 0) < min_market_cap:
                 continue
-            if sector != "any" and s.get("sector") != sector:
+            if sector != 'any' and stock.get('sector') != sector:
                 continue
-            filt.append(s["ticker"])
-        return jsonify(filt)
+            filtered_stocks.append(stock['ticker'])
+
+        return jsonify(filtered_stocks)
     except ValueError as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
     except Exception as e:
-        import traceback
+        import traceback; print(traceback.format_exc())
+        return jsonify({'error': f'篩選器發生錯誤: {str(e)}'}), 500
 
-        print(traceback.format_exc())
-        return jsonify({"error": f"篩選器錯誤: {e}"}), 500
-
-
-# ── ── ── 其他 ──────────────────────────────────────────
-@app.route("/", methods=["GET"])
-@app.route("/api/debug")
+@app.route('/', methods=['GET'])
+@app.route('/api/debug')
 def debug_handler():
-    return jsonify({k: v for k, v in os.environ.items()})
-
+    env_vars = {key: value for key, value in os.environ.items()}
+    return jsonify(env_vars)
 
 def index():
     return "Python backend is running."
-
-
-# ── ── ── Main ──────────────────────────────────────────
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
