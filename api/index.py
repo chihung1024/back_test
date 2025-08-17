@@ -6,7 +6,7 @@ from pandas.tseries.offsets import MonthEnd
 import os
 
 # 引入您專案中已經存在的數據處理和計算模組
-from api.utils import data_handler, calculations 
+from api.utils import data_handler, calculations
 
 app = Flask(__name__)
 
@@ -81,8 +81,8 @@ def scan_handler():
         print(traceback.format_exc())
         return jsonify({'error': f'伺服器發生未預期的錯誤: {str(e)}'}), 500
 
-# 為了簡潔，暫時移除了 backtest 和 screener 的後端邏輯
-# 您可以後續參照 scan_handler 的模式，將它們也改為讀取預載數據
+# To keep things simple, the backend logic for backtest and screener has been temporarily removed.
+# You can add them back later, following the same pattern as scan_handler.
 
 @app.route('/', methods=['GET'])
 def index():
