@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "research/country_momentum_backtest.py"
+      - "research/fast_country_momentum_runner.py"
       - ".github/workflows/country-momentum-research.yml"
   workflow_dispatch:
 
@@ -28,7 +29,7 @@ jobs:
           pip install "yfinance>=0.2.54" "pandas>=2.2" "numpy>=1.26"
 
       - name: Run country ETF momentum research
-        run: python research/country_momentum_backtest.py
+        run: python research/fast_country_momentum_runner.py
 
       - name: Upload research artifacts
         uses: actions/upload-artifact@v4
