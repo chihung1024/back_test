@@ -1,0 +1,39 @@
+name: Country ETF Momentum Research
+
+on:
+  pull_request:
+    paths:
+      - "research/country_momentum_backtest.py"
+      - ".github/workflows/country-momentum-research.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install research dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "yfinance>=0.2.54" "pandas>=2.2" "numpy>=1.26"
+
+      - name: Run country ETF momentum research
+        run: python research/country_momentum_backtest.py
+
+      - name: Upload research artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: country-etf-momentum-results
+          path: research/results/
+          retention-days: 14
+          if-no-files-found: error
